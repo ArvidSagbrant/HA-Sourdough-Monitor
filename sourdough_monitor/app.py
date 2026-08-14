@@ -14,7 +14,7 @@ import requests
 LOG = logging.getLogger('sourdough')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); UI_PATH=Path('/app/ui.html')
+OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
 DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.3.0'
 
@@ -118,7 +118,34 @@ def bake_detail(bid):
         out['measurement_summary']=dict(m)
     return out
 
+DETECTION_DEFAULTS={'blur_kernel':7,'sobel_kernel':3,'row_smoothing':9,'search_top_pct':5,'search_bottom_pct':95,'polarity':'both','candidate_count':4,'max_jump_pct':8}
+DETECTION_KEYS=set(DETECTION_DEFAULTS)
+
 def load_options(): return json.loads(OPTIONS_PATH.read_text())
+def validate_detection(v):
+    out={}
+    for key,lo,hi in [('blur_kernel',1,31),('sobel_kernel',1,7),('row_smoothing',1,51),('search_top_pct',0,90),('search_bottom_pct',10,100),('candidate_count',1,8),('max_jump_pct',0,50)]:
+        value=int(round(float(v.get(key,DETECTION_DEFAULTS[key]))))
+        if not lo<=value<=hi: raise ValueError(f'Ogiltigt värde för {key}')
+        if key in {'blur_kernel','sobel_kernel','row_smoothing'} and value%2==0: value+=1
+        out[key]=min(value,hi)
+    out['polarity']=str(v.get('polarity','both'))
+    if out['polarity'] not in {'both','dark_to_light','light_to_dark'}: raise ValueError('Ogiltig kantriktning')
+    if out['search_top_pct']>=out['search_bottom_pct']: raise ValueError('Sökintervallets början måste vara före slutet')
+    return out
+def load_detection_override():
+    try: return validate_detection(json.loads(DETECTION_OVERRIDE_PATH.read_text())) if DETECTION_OVERRIDE_PATH.exists() else {}
+    except: LOG.exception('Kunde inte läsa detektionsinställningar'); return {}
+def current_detection():
+    with cfg_lock: return {k:cfg.get(k,DETECTION_DEFAULTS[k]) for k in DETECTION_DEFAULTS}
+def save_detection_override(v):
+    clean=validate_detection(v); tmp=DETECTION_OVERRIDE_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(clean,indent=2)); tmp.replace(DETECTION_OVERRIDE_PATH)
+    with cfg_lock: cfg.update(clean)
+    return clean
+def clear_detection_override():
+    if DETECTION_OVERRIDE_PATH.exists(): DETECTION_OVERRIDE_PATH.unlink()
+    with cfg_lock: cfg.update(DETECTION_DEFAULTS)
+    return current_detection()
 def load_roi_override():
     try:
         d=json.loads(ROI_OVERRIDE_PATH.read_text()) if ROI_OVERRIDE_PATH.exists() else {}; allowed={'roi_x_pct','roi_y_pct','roi_width_pct','roi_height_pct'}; return {k:int(v) for k,v in d.items() if k in allowed}
@@ -201,9 +228,36 @@ def fetch_rtsp_frame():
 def fetch_frame(): return fetch_snapshot_frame() if str(cfg.get('camera_source','snapshot')).lower()=='snapshot' else fetch_rtsp_frame()
 def roi_from_image(img):
     h,w=img.shape[:2]; r=current_roi(); x=int(w*r['roi_x_pct']/100); y=int(h*r['roi_y_pct']/100); x2=min(w,x+int(w*r['roi_width_pct']/100)); y2=min(h,y+int(h*r['roi_height_pct']/100)); return x,y,x2,y2
-def detect_top(img):
-    x1,y1,x2,y2=roi_from_image(img); crop=img[y1:y2,x1:x2]; gray=cv2.GaussianBlur(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),(7,7),0); score=np.mean(np.abs(cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)),axis=1); margin=max(5,int(len(score)*.05)); usable=score[margin:len(score)-margin]
-    ly=int(np.argmax(usable))+margin; conf=float(score[ly]/(np.mean(usable)+1e-6)); gy=y1+ly; edge_history.append(gy); sy=int(statistics.median(edge_history)); return sy,max(1,y2-sy),conf,(x1,y1,x2,y2)
+def detect_top(img, params=None, update_history=True):
+    p={**current_detection(),**(params or {})}; x1,y1,x2,y2=roi_from_image(img); crop=img[y1:y2,x1:x2]
+    gray=cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY); blur=int(p['blur_kernel'])
+    if blur>1: gray=cv2.GaussianBlur(gray,(blur,blur),0)
+    grad=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=int(p['sobel_kernel']))
+    if p['polarity']=='dark_to_light': grad=np.maximum(grad,0)
+    elif p['polarity']=='light_to_dark': grad=np.maximum(-grad,0)
+    else: grad=np.abs(grad)
+    # Median across the width rejects narrow reflections and vertical jar details.
+    score=np.percentile(grad,65,axis=1); smooth=int(p['row_smoothing'])
+    if smooth>1: score=cv2.GaussianBlur(score.reshape(-1,1),(1,smooth),0).ravel()
+    start=max(0,int(len(score)*int(p['search_top_pct'])/100)); stop=min(len(score),int(len(score)*int(p['search_bottom_pct'])/100))
+    # Once a session has a stable edge, only accept physically plausible movement.
+    # Expressing the limit as a percentage keeps it independent of camera resolution.
+    continuity_start,continuity_stop=start,stop
+    if update_history and edge_history and int(p['max_jump_pct'])>0:
+        previous=int(statistics.median(edge_history))-y1
+        max_jump=max(1,int(len(score)*int(p['max_jump_pct'])/100))
+        continuity_start=max(start,previous-max_jump); continuity_stop=min(stop,previous+max_jump+1)
+    usable=score[continuity_start:continuity_stop]
+    if not len(usable): raise ValueError('Tomt sökintervall')
+    ly=int(np.argmax(usable))+continuity_start; conf=float(score[ly]/(np.mean(usable)+1e-6)); gy=y1+ly
+    if update_history: edge_history.append(gy); sy=int(statistics.median(edge_history))
+    else: sy=gy
+    order=np.argsort(usable)[::-1]; candidates=[]
+    for index in order:
+        row=int(index)+continuity_start
+        if all(abs(row-old)>=max(3,smooth//2) for old in candidates): candidates.append(row)
+        if len(candidates)>=int(p['candidate_count']): break
+    return sy,max(1,y2-sy),conf,(x1,y1,x2,y2),[y1+r for r in candidates]
 def annotate(img,edge,roi,growth,conf,status):
     x1,y1,x2,y2=roi; out=img.copy(); cv2.rectangle(out,(x1,y1),(x2,y2),(255,255,255),2); cv2.line(out,(x1,edge),(x2,edge),(255,255,255),3); cv2.putText(out,f'{growth:.1f}%  conf {conf:.2f}  {status}',(x1,max(30,y1-10)),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2,cv2.LINE_AA); return out
 def infer_status(g):
@@ -216,6 +270,14 @@ def infer_status(g):
     if g>=150:return 'strong_rise'
     if g>=110:return 'rising'
     return 'start'
+def annotate_detection(img,edge,roi,conf,candidates,params):
+    x1,y1,x2,y2=roi; out=img.copy(); cv2.rectangle(out,(x1,y1),(x2,y2),(0,229,255),2)
+    for y in candidates[1:]: cv2.line(out,(x1,y),(x2,y),(0,140,255),1)
+    cv2.line(out,(x1,edge),(x2,edge),(80,255,80),3)
+    top=y1+int((y2-y1)*int(params['search_top_pct'])/100); bottom=y1+int((y2-y1)*int(params['search_bottom_pct'])/100)
+    cv2.line(out,(x1,top),(x2,top),(255,120,80),1); cv2.line(out,(x1,bottom),(x2,bottom),(255,120,80),1)
+    cv2.putText(out,f'VALD KANT y={edge}  konfidens={conf:.2f}',(x1,max(28,y1-10)),cv2.FONT_HERSHEY_SIMPLEX,.65,(80,255,80),2,cv2.LINE_AA)
+    return out
 def media_uri(path): return 'media-source://media_source/local/'+path.relative_to(Path('/media')).as_posix()
 def publish_timelapse_state(state,session=None,frames=None,duration_seconds=None,path=None):
     publish(f'{BASE_TOPIC}/state/timelapse',state,True); a={}
@@ -260,7 +322,7 @@ def stop_session():
     publish(f'{BASE_TOPIC}/state/active','OFF',True)
 def process_frame():
     global frame_no,baseline_height_px,peak_growth,peak_frame_path,start_frame_path,last_frame_path
-    img=fetch_frame(); edge,height,conf,roi=detect_top(img)
+    img=fetch_frame(); edge,height,conf,roi,_=detect_top(img)
     with session_lock:
         if baseline_height_px is None: baseline_height_px=height
         growth=100.*height/max(1,baseline_height_px); status=infer_status(growth); ann=annotate(img,edge,roi,growth,conf,status); fp=session_dir/'frames'/f'{frame_no:06d}.jpg'; cv2.imwrite(str(fp),ann,[cv2.IMWRITE_JPEG_QUALITY,88])
@@ -286,6 +348,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in {'','/'}:
             data=UI_PATH.read_bytes(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(data))); self.end_headers(); return self.wfile.write(data)
         if path.endswith('/api/config') or path=='/api/config': return self._json(200,{'camera_source':cfg.get('camera_source'),'camera_url':cfg.get('camera_url'),**current_roi(),'override_active':ROI_OVERRIDE_PATH.exists(),'active_bake_id':active_bake_id,'session_active':session_active})
+        if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,{**current_detection(),'override_active':DETECTION_OVERRIDE_PATH.exists()})
+        if path.endswith('/api/detection-preview.jpg') or path=='/api/detection-preview.jpg':
+            try:
+                raw={k:qs[k][0] for k in DETECTION_KEYS if k in qs}; params=validate_detection({**current_detection(),**raw}); img=fetch_frame(); edge,_,conf,roi,candidates=detect_top(img,params,False); ann=annotate_detection(img,edge,roi,conf,candidates,params); ok,enc=cv2.imencode('.jpg',ann,[cv2.IMWRITE_JPEG_QUALITY,90]); data=enc.tobytes(); self.send_response(200); self.send_header('Content-Type','image/jpeg'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); return self.wfile.write(data)
+            except Exception as e: LOG.exception('Detektionspreview misslyckades'); return self.send_error(502,str(e))
         if path.endswith('/api/preview.jpg') or path=='/api/preview.jpg':
             try:
                 img=fetch_frame(); ok,enc=cv2.imencode('.jpg',img,[cv2.IMWRITE_JPEG_QUALITY,88]); data=enc.tobytes(); self.send_response(200); self.send_header('Content-Type','image/jpeg'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); return self.wfile.write(data)
@@ -304,6 +371,7 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path.rstrip('/')
         try:
             if path.endswith('/api/roi') or path=='/api/roi': return self._json(200,save_roi_override(self._body()))
+            if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,save_detection_override(self._body()))
             if path.endswith('/api/bakes') or path=='/api/bakes': return self._json(201,create_bake(self._body()))
             if path.endswith('/api/active-bake') or path=='/api/active-bake':
                 p=self._body(); set_active_bake(p.get('id')); return self._json(200,{'active_bake_id':active_bake_id})
@@ -326,6 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed():return self.send_error(403)
         path=urlparse(self.path).path.rstrip('/')
         if path.endswith('/api/roi') or path=='/api/roi': return self._json(200,clear_roi_override())
+        if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,clear_detection_override())
         return self.send_error(404)
     def log_message(self,fmt,*args): LOG.debug('Web UI: '+fmt,*args)
 
@@ -347,7 +416,7 @@ def setup_mqtt():
 
 def main():
     global cfg,edge_history
-    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(load_roi_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
+    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
     while True:
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))
