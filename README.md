@@ -20,7 +20,7 @@ Kopiera mappen `sourdough_monitor` till `/addons/sourdough_monitor` på Home Ass
 
 ## Kamera
 
-Tillägget stöder snapshot-URL och RTSP, separat användarnamn och lösenord samt TCP eller UDP för RTSP. Använd fliken **Kamera & ROI** för att kontrollera bilden och markera området som ska analyseras.
+Tillägget stöder snapshot-URL och RTSP, separat användarnamn och lösenord samt TCP eller UDP för RTSP. Använd fliken **Kamera & detektion** för att kontrollera bilden och markera området som ska analyseras. Kamerabilden kan zoomas upp till 800 % med knappar, mushjul eller nypgest och panoreras genom att dra.
 
 Under **Kamera & detektion → Detektionslabb** kan OpenCV-inställningarna provas mot kamerans livebild innan de sparas. Den gröna linjen visar vald degkant, orange linjer visar alternativa kandidater och de blå linjerna visar det aktiva sökintervallet. Börja med att begränsa sökintervallet så burkens kant inte ingår; prova sedan kontrastriktning och utjämning. **Max hopp** begränsar hur långt kanten får flytta sig mellan två mätningar, angivet som procent av ROI-höjden (`0 %` stänger av begränsningen). Sparade värden används direkt av övervakningen och ligger beständigt i `/data/detection.json`.
 
