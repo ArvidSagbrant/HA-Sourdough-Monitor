@@ -1,0 +1,62 @@
+name: "Sourdough Monitor"
+version: "0.2.0"
+slug: "sourdough_monitor"
+description: "Monitor a sourdough starter with IP Webcam, OpenCV, MQTT Discovery and automatic timelapse."
+url: "https://github.com/local/sourdough-monitor"
+startup: application
+boot: auto
+init: false
+arch:
+  - amd64
+  - aarch64
+  - armv7
+homeassistant_api: true
+hassio_api: true
+hassio_role: default
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:bread-slice
+panel_title: "Sourdough Monitor"
+map:
+  - type: media
+    read_only: false
+options:
+  camera_source: "snapshot"
+  camera_url: "http://192.168.1.100/snapshot.jpg"
+  camera_username: ""
+  camera_password: ""
+  rtsp_transport: "tcp"
+  mqtt_host: "192.168.1.10"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_tls: false
+  interval_seconds: 60
+  roi_x_pct: 30
+  roi_y_pct: 10
+  roi_width_pct: 40
+  roi_height_pct: 85
+  smoothing_frames: 5
+  timelapse_fps: 30
+  timelapse_refresh_minutes: 30
+  keep_sessions: 10
+schema:
+  camera_source: list(snapshot|rtsp)
+  camera_url: str
+  camera_username: str?
+  camera_password: password?
+  rtsp_transport: list(tcp|udp)
+  mqtt_host: str
+  mqtt_port: int(1,65535)
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_tls: bool
+  interval_seconds: int(10,3600)
+  roi_x_pct: int(0,95)
+  roi_y_pct: int(0,95)
+  roi_width_pct: int(5,100)
+  roi_height_pct: int(5,100)
+  smoothing_frames: int(1,25)
+  timelapse_fps: int(1,60)
+  timelapse_refresh_minutes: int(0,1440)
+  keep_sessions: int(1,100)
