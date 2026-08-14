@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.2.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.3.0'
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock()
 session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS bakes (
  result_json TEXT NOT NULL DEFAULT '{}', media_json TEXT NOT NULL DEFAULT '{}', notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, bake_id TEXT NOT NULL, kind TEXT NOT NULL, ts TEXT NOT NULL, data_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS measurements (seq INTEGER PRIMARY KEY AUTOINCREMENT, bake_id TEXT NOT NULL, session TEXT, ts TEXT NOT NULL, growth REAL, height_px INTEGER, edge_y INTEGER, confidence REAL, status TEXT);
+CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_bake_ts ON events(bake_id,ts);
 CREATE INDEX IF NOT EXISTS idx_measurements_bake_ts ON measurements(bake_id,ts);
 '''
@@ -45,6 +46,17 @@ def db():
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as c: c.executescript(SCHEMA)
+def load_active_bake():
+    global active_bake_id
+    with db() as c: row=c.execute("SELECT value FROM app_state WHERE key='active_bake_id'").fetchone()
+    active_bake_id=row['value'] if row else None
+    if active_bake_id:
+        try: get_bake(active_bake_id)
+        except KeyError: active_bake_id=None
+def persist_active_bake():
+    with db() as c:
+        if active_bake_id is None: c.execute("DELETE FROM app_state WHERE key='active_bake_id'")
+        else: c.execute("INSERT INTO app_state(key,value) VALUES('active_bake_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(active_bake_id,))
 def decode_bake(r):
     d=dict(r)
     for k in JSON_COLS: d[k]=json.loads(d.pop(k+'_json') or '{}')
@@ -73,7 +85,7 @@ def create_bake(p):
     with db() as c:
         c.execute('''INSERT INTO bakes(id,name,status,started_at,recipe_json,process_json,bake_json,result_json,media_json,notes,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(bid,name,p.get('status','active'),p.get('started_at') or ts,*vals,p.get('notes',''),ts,ts))
-    active_bake_id=bid; add_event(bid,'created',{'name':name}); publish_journal_state(); return get_bake(bid)
+    active_bake_id=bid; persist_active_bake(); add_event(bid,'created',{'name':name}); publish_journal_state(); return get_bake(bid)
 def update_bake(bid,p):
     cur=get_bake(bid); sets=[]; args=[]
     for k in ('name','status','started_at','finished_at','notes'):
@@ -93,7 +105,7 @@ def phase_bake(bid,phase,data=None):
 def set_active_bake(bid):
     global active_bake_id
     if bid is not None: get_bake(bid)
-    active_bake_id=bid; publish_journal_state()
+    active_bake_id=bid; persist_active_bake(); publish_journal_state()
 def add_measurement(bid,session,growth,height,edge,conf,status):
     if not bid: return
     with db() as c: c.execute('INSERT INTO measurements(bake_id,session,ts,growth,height_px,edge_y,confidence,status) VALUES(?,?,?,?,?,?,?,?)',(bid,session,now_iso(),growth,height,edge,conf,status))
@@ -128,7 +140,18 @@ def clear_roi_override():
         for k in ('roi_x_pct','roi_y_pct','roi_width_pct','roi_height_pct'): cfg[k]=base[k]
     return current_roi()
 
-def get_mqtt_service(): return str(cfg['mqtt_host']).strip(),int(cfg.get('mqtt_port',1883)),str(cfg.get('mqtt_username','') or ''),str(cfg.get('mqtt_password','') or ''),bool(cfg.get('mqtt_tls',False))
+def supervisor_mqtt_service():
+    token=os.environ.get('SUPERVISOR_TOKEN')
+    if not token: raise RuntimeError('SUPERVISOR_TOKEN saknas')
+    r=requests.get('http://supervisor/services/mqtt',headers={'Authorization':f'Bearer {token}'},timeout=10)
+    r.raise_for_status(); body=r.json()
+    if body.get('result')!='ok': raise RuntimeError(body.get('message') or 'MQTT-tjänsten kunde inte hämtas')
+    data=body.get('data') or {}
+    return str(data['host']),int(data.get('port',1883)),str(data.get('username','') or ''),str(data.get('password','') or ''),bool(data.get('ssl',False))
+def get_mqtt_service():
+    host=str(cfg.get('mqtt_host','') or '').strip()
+    if not host: return supervisor_mqtt_service()
+    return host,int(cfg.get('mqtt_port',1883)),str(cfg.get('mqtt_username','') or ''),str(cfg.get('mqtt_password','') or ''),bool(cfg.get('mqtt_tls',False))
 def publish(topic,payload,retain=False):
     if mqtt_client is None:return
     if not isinstance(payload,str): payload=json.dumps(payload,ensure_ascii=False)
@@ -144,7 +167,9 @@ def publish_discovery():
         if sc:p['state_class']=sc
         publish(f'{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{oid}/config',p,True)
     for oid,name,icon in [('status','Surdeg status','mdi:state-machine'),('session','Surdeg session','mdi:identifier'),('active_bake','Aktivt bak','mdi:bread-slice')]:
-        publish(f'{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{oid}/config',{'name':name,'unique_id':f'{DEVICE_ID}_{oid}','state_topic':f'{BASE_TOPIC}/state/{oid}','json_attributes_topic':f'{BASE_TOPIC}/attributes/{oid}' if oid=='active_bake' else None,'availability_topic':av,'device':dev,'icon':icon},True)
+        payload={'name':name,'unique_id':f'{DEVICE_ID}_{oid}','state_topic':f'{BASE_TOPIC}/state/{oid}','availability_topic':av,'device':dev,'icon':icon}
+        if oid=='active_bake': payload['json_attributes_topic']=f'{BASE_TOPIC}/attributes/{oid}'
+        publish(f'{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{oid}/config',payload,True)
     publish(f'{DISCOVERY_PREFIX}/image/{DEVICE_ID}/preview/config',{'name':'Surdeg preview','unique_id':f'{DEVICE_ID}_preview','image_topic':f'{BASE_TOPIC}/image/preview','content_type':'image/jpeg','availability_topic':av,'device':dev},True)
     publish(f'{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/timelapse/config',{'name':'Surdeg timelapse','unique_id':f'{DEVICE_ID}_timelapse','state_topic':f'{BASE_TOPIC}/state/timelapse','json_attributes_topic':f'{BASE_TOPIC}/attributes/timelapse','availability_topic':av,'device':dev,'icon':'mdi:movie-open'},True)
     publish(f'{DISCOVERY_PREFIX}/binary_sensor/{DEVICE_ID}/active/config',{'name':'Surdeg övervakning','unique_id':f'{DEVICE_ID}_active','state_topic':f'{BASE_TOPIC}/state/active','payload_on':'ON','payload_off':'OFF','availability_topic':av,'device':dev,'icon':'mdi:camera-timer'},True)
@@ -318,10 +343,11 @@ def setup_mqtt():
     if user:c.username_pw_set(user,password)
     if ssl:c.tls_set()
     c.will_set(f'{BASE_TOPIC}/availability','offline',retain=True); c.on_connect=on_connect; c.on_message=on_message; c.connect(host,port,60); c.loop_start(); mqtt_client=c
+    LOG.info('Ansluten till MQTT på %s:%s',host,port)
 
 def main():
     global cfg,edge_history
-    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); cfg=load_options(); cfg.update(load_roi_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
+    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(load_roi_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
     while True:
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))
