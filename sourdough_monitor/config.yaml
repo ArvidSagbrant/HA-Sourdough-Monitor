@@ -1,8 +1,8 @@
 name: "Sourdough Monitor"
-version: "0.2.0"
+version: "0.3.0"
 slug: "sourdough_monitor"
 description: "Monitor a sourdough starter with IP Webcam, OpenCV, MQTT Discovery and automatic timelapse."
-url: "https://github.com/local/sourdough-monitor"
+url: "https://github.com/ArvidSagbrant/HA-Sourdough-Monitor"
 startup: application
 boot: auto
 init: false
@@ -13,6 +13,8 @@ arch:
 homeassistant_api: true
 hassio_api: true
 hassio_role: default
+services:
+  - mqtt:need
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:bread-slice
@@ -26,7 +28,7 @@ options:
   camera_username: ""
   camera_password: ""
   rtsp_transport: "tcp"
-  mqtt_host: "192.168.1.10"
+  mqtt_host: ""
   mqtt_port: 1883
   mqtt_username: ""
   mqtt_password: ""
@@ -46,7 +48,7 @@ schema:
   camera_username: str?
   camera_password: password?
   rtsp_transport: list(tcp|udp)
-  mqtt_host: str
+  mqtt_host: str?
   mqtt_port: int(1,65535)
   mqtt_username: str?
   mqtt_password: password?
