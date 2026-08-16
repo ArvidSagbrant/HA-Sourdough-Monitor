@@ -301,7 +301,7 @@ A timelapse requires at least two captured frames. Confirm that monitoring ran l
 
 ## Contributing
 
-Issues and pull requests are welcome. Please describe the camera type, input mode, Home Assistant installation type, add-on architecture, relevant log messages, and steps to reproduce when reporting a problem. Do not include camera or MQTT credentials in logs, screenshots, issues, or commits.
+This is a quick project for my own personal use. No contributions are accepted at this time.
 
 ## License
 
