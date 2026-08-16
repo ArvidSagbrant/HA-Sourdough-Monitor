@@ -1,3 +1,6 @@
+# Copyright 2026 Arvid Sagbrant
+# SPDX-License-Identifier: Apache-2.0
+
 import hashlib, json, logging, os, shutil, sqlite3, statistics, subprocess, threading, time, uuid
 from collections import deque
 from contextlib import contextmanager

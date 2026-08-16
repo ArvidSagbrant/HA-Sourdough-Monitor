@@ -1,5 +1,7 @@
 # HA Sourdough Monitor
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Ett lokalt Home Assistant-tillägg som övervakar en surdegsstarter med en nätverkskamera, OpenCV och MQTT Discovery. Tillägget innehåller även en bakjournal med fotodokumentation och skapar keyframes samt timelapse-videor.
 
 ## Installation som add-on repository
@@ -41,3 +43,9 @@ MQTT Discovery skapar sensorer för tillväxt, höjd, status, session och aktivt
 ## Utveckling
 
 Add-on-filerna finns i `sourdough_monitor/`. `repository.yaml` gör repositoryt kompatibelt med Home Assistants add-on store.
+
+## Licens
+
+Projektet licensieras under [Apache License 2.0](LICENSE). Copyright 2026 Arvid Sagbrant.
+
+Licensen gäller projektets egen källkod och dokumentation. Tredjepartsberoenden som ingår i eller hämtas av containeravbildningen omfattas av sina respektive licenser.

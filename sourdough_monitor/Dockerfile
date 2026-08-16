@@ -1,3 +1,6 @@
+# Copyright 2026 Arvid Sagbrant
+# SPDX-License-Identifier: Apache-2.0
+
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.22
 FROM ${BUILD_FROM}
 
@@ -15,6 +18,7 @@ RUN /opt/venv/bin/python -c "import cv2, numpy, requests; print('OpenCV', cv2.__
 
 COPY app.py /app/app.py
 COPY ui.html /app/ui.html
+COPY LICENSE NOTICE /app/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
