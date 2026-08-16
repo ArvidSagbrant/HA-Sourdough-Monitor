@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.0
+
+- Added solid black backgrounds behind OpenCV overlay labels for consistent text contrast.
+- Added black outlines behind ROI, detection, candidate, and search-boundary lines so they remain visible on both light and dark images.
+
 ## 0.7.0
 
 - Added photo uploads to each bake, with optional captions and support for multiple process photos.

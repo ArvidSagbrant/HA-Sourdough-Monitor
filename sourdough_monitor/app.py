@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.7.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.8.0'
 MAX_PHOTO_BYTES=15*1024*1024; MAX_PHOTO_EDGE=2560
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock(); photo_lock=threading.RLock()
@@ -338,8 +338,18 @@ def detect_top(img, params=None, update_history=True):
         if all(abs(row-old)>=max(3,smooth//2) for old in candidates): candidates.append(row)
         if len(candidates)>=int(p['candidate_count']): break
     return sy,max(1,y2-sy),conf,(x1,y1,x2,y2),[y1+r for r in candidates]
+def draw_contrast_line(img,start,end,color,thickness=1):
+    cv2.line(img,start,end,(0,0,0),thickness+4,cv2.LINE_AA)
+    cv2.line(img,start,end,color,thickness,cv2.LINE_AA)
+def draw_contrast_rectangle(img,start,end,color,thickness=1):
+    cv2.rectangle(img,start,end,(0,0,0),thickness+4,cv2.LINE_AA)
+    cv2.rectangle(img,start,end,color,thickness,cv2.LINE_AA)
+def draw_contrast_text(img,text,origin,color,font_scale=.8,thickness=2):
+    font=cv2.FONT_HERSHEY_SIMPLEX; (width,height),baseline=cv2.getTextSize(text,font,font_scale,thickness); x,y=origin; padding=6
+    cv2.rectangle(img,(x-padding,y-height-padding),(x+width+padding,y+baseline+padding),(0,0,0),cv2.FILLED)
+    cv2.putText(img,text,(x,y),font,font_scale,color,thickness,cv2.LINE_AA)
 def annotate(img,edge,roi,growth,conf,status):
-    x1,y1,x2,y2=roi; out=img.copy(); cv2.rectangle(out,(x1,y1),(x2,y2),(255,255,255),2); cv2.line(out,(x1,edge),(x2,edge),(255,255,255),3); cv2.putText(out,f'{growth:.1f}%  conf {conf:.2f}  {status}',(x1,max(30,y1-10)),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2,cv2.LINE_AA); return out
+    x1,y1,x2,y2=roi; out=img.copy(); draw_contrast_rectangle(out,(x1,y1),(x2,y2),(255,255,255),2); draw_contrast_line(out,(x1,edge),(x2,edge),(255,255,255),3); draw_contrast_text(out,f'{growth:.1f}%  conf {conf:.2f}  {status}',(x1,max(30,y1-10)),(255,255,255)); return out
 def infer_status(g):
     last_growth_values.append(g)
     if g<105:return 'start'
@@ -351,12 +361,12 @@ def infer_status(g):
     if g>=110:return 'rising'
     return 'start'
 def annotate_detection(img,edge,roi,conf,candidates,params):
-    x1,y1,x2,y2=roi; out=img.copy(); cv2.rectangle(out,(x1,y1),(x2,y2),(0,229,255),2)
-    for y in candidates[1:]: cv2.line(out,(x1,y),(x2,y),(0,140,255),1)
-    cv2.line(out,(x1,edge),(x2,edge),(80,255,80),3)
+    x1,y1,x2,y2=roi; out=img.copy(); draw_contrast_rectangle(out,(x1,y1),(x2,y2),(0,229,255),2)
+    for y in candidates[1:]: draw_contrast_line(out,(x1,y),(x2,y),(0,140,255),1)
+    draw_contrast_line(out,(x1,edge),(x2,edge),(80,255,80),3)
     top=y1+int((y2-y1)*int(params['search_top_pct'])/100); bottom=y1+int((y2-y1)*int(params['search_bottom_pct'])/100)
-    cv2.line(out,(x1,top),(x2,top),(255,120,80),1); cv2.line(out,(x1,bottom),(x2,bottom),(255,120,80),1)
-    cv2.putText(out,f'VALD KANT y={edge}  konfidens={conf:.2f}',(x1,max(28,y1-10)),cv2.FONT_HERSHEY_SIMPLEX,.65,(80,255,80),2,cv2.LINE_AA)
+    draw_contrast_line(out,(x1,top),(x2,top),(255,120,80),1); draw_contrast_line(out,(x1,bottom),(x2,bottom),(255,120,80),1)
+    draw_contrast_text(out,f'VALD KANT y={edge}  konfidens={conf:.2f}',(x1,max(28,y1-10)),(80,255,80),.65,2)
     return out
 def media_uri(path): return 'media-source://media_source/local/'+path.relative_to(Path('/media')).as_posix()
 def publish_timelapse_state(state,session=None,frames=None,duration_seconds=None,path=None):
