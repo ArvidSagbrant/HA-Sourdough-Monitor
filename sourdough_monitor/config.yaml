@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: "Sourdough Monitor"
-version: "0.9.0"
+version: "0.9.1"
 slug: "sourdough_monitor"
 description: "Monitor a sourdough starter with IP Webcam, OpenCV, MQTT Discovery and automatic timelapse."
 url: "https://github.com/ArvidSagbrant/HA-Sourdough-Monitor"
@@ -31,6 +31,8 @@ options:
   camera_username: ""
   camera_password: ""
   rtsp_transport: "tcp"
+  camera_timeout_seconds: 20
+  camera_retries: 1
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_username: ""
@@ -51,6 +53,8 @@ schema:
   camera_username: str?
   camera_password: password?
   rtsp_transport: list(tcp|udp)
+  camera_timeout_seconds: int(5,60)
+  camera_retries: int(0,5)
   mqtt_host: str?
   mqtt_port: int(1,65535)
   mqtt_username: str?

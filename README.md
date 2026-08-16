@@ -91,6 +91,8 @@ The MQTT connection is normally obtained automatically from Home Assistant's MQT
 | `camera_username` | empty | Optional camera username. |
 | `camera_password` | empty | Optional camera password. |
 | `rtsp_transport` | `tcp` | RTSP transport: `tcp` or `udp`. |
+| `camera_timeout_seconds` | `20` | Maximum wait for one RTSP frame attempt. |
+| `camera_retries` | `1` | Extra RTSP frame attempts after a temporary failure. |
 | `mqtt_host` | empty | External MQTT host. Leave empty to use Home Assistant's MQTT service. |
 | `mqtt_port` | `1883` | External MQTT port. |
 | `mqtt_username` | empty | External MQTT username. |

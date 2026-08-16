@@ -1,7 +1,7 @@
 # Copyright 2026 Arvid Sagbrant
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib, json, logging, os, shutil, sqlite3, statistics, subprocess, threading, time, uuid
+import hashlib, json, logging, os, re, shutil, sqlite3, statistics, subprocess, threading, time, uuid
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
@@ -19,8 +19,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.9.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.9.1'
 MAX_PHOTO_BYTES=15*1024*1024; MAX_PHOTO_EDGE=2560
+
+class CameraError(RuntimeError): pass
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock(); photo_lock=threading.RLock()
 session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
@@ -370,16 +372,38 @@ def camera_url_with_credentials(url):
     if '@' in parts.netloc:return url
     auth=quote(u,safe='')+(':'+quote(p,safe='') if p else '')
     return urlunsplit((parts.scheme,f'{auth}@{parts.netloc}',parts.path,parts.query,parts.fragment))
+def safe_camera_error(value):
+    text=re.sub(r'(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@',r'\1***@',str(value))
+    password=str(cfg.get('camera_password','') or '')
+    return text.replace(password,'***') if password else text
 def fetch_snapshot_frame():
-    auth=(cfg['camera_username'],cfg.get('camera_password','')) if cfg.get('camera_username') else None; r=requests.get(cfg['camera_url'],auth=auth,timeout=15); r.raise_for_status(); img=cv2.imdecode(np.frombuffer(r.content,np.uint8),cv2.IMREAD_COLOR)
-    if img is None: raise RuntimeError('Snapshot kunde inte avkodas'); return img
+    try:
+        auth=(cfg['camera_username'],cfg.get('camera_password','')) if cfg.get('camera_username') else None; r=requests.get(cfg['camera_url'],auth=auth,timeout=15); r.raise_for_status(); img=cv2.imdecode(np.frombuffer(r.content,np.uint8),cv2.IMREAD_COLOR)
+    except requests.RequestException as e: raise CameraError(safe_camera_error(e)) from None
+    if img is None: raise CameraError('Snapshot kunde inte avkodas')
     return img
 def fetch_rtsp_frame():
-    cmd=['ffmpeg','-hide_banner','-loglevel','error','-rtsp_transport',str(cfg.get('rtsp_transport','tcp')),'-i',camera_url_with_credentials(cfg['camera_url']),'-map','0:v:0','-frames:v','1','-f','image2pipe','-vcodec','mjpeg','pipe:1']; p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
-    if p.returncode or not p.stdout: raise RuntimeError('ffmpeg kunde inte läsa RTSP: '+p.stderr.decode(errors='replace'))
-    img=cv2.imdecode(np.frombuffer(p.stdout,np.uint8),cv2.IMREAD_COLOR)
-    if img is None: raise RuntimeError('RTSP-frame kunde inte avkodas')
-    return img
+    timeout=max(5,int(cfg.get('camera_timeout_seconds',20))); attempts=1+max(0,int(cfg.get('camera_retries',1)))
+    cmd=['ffmpeg','-hide_banner','-loglevel','error','-rtsp_transport',str(cfg.get('rtsp_transport','tcp')),'-i',camera_url_with_credentials(cfg['camera_url']),'-map','0:v:0','-frames:v','1','-f','image2pipe','-vcodec','mjpeg','pipe:1']
+    last_error='okänt kamerafel'
+    for attempt in range(1,attempts+1):
+        try:
+            p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+            if p.returncode or not p.stdout:
+                detail=safe_camera_error(p.stderr.decode(errors='replace').strip())
+                last_error=('ffmpeg avslutades utan en bildruta'+(f': {detail[:500]}' if detail else ''))
+            else:
+                img=cv2.imdecode(np.frombuffer(p.stdout,np.uint8),cv2.IMREAD_COLOR)
+                if img is not None:return img
+                last_error='RTSP-bildrutan kunde inte avkodas'
+        except subprocess.TimeoutExpired:
+            last_error=f'RTSP-kameran svarade inte inom {timeout} sekunder'
+        except OSError as e:
+            last_error=f'ffmpeg kunde inte startas: {safe_camera_error(e)}'
+        if attempt<attempts:
+            LOG.warning('RTSP-hämtning misslyckades (försök %s/%s): %s; försöker igen',attempt,attempts,last_error)
+            time.sleep(2)
+    raise CameraError(f'{last_error} efter {attempts} försök')
 def fetch_frame(): return fetch_snapshot_frame() if str(cfg.get('camera_source','snapshot')).lower()=='snapshot' else fetch_rtsp_frame()
 def roi_from_image(img):
     h,w=img.shape[:2]; r=current_roi(); x=int(w*r['roi_x_pct']/100); y=int(h*r['roi_y_pct']/100); x2=min(w,x+int(w*r['roi_width_pct']/100)); y2=min(h,y+int(h*r['roi_height_pct']/100)); return x,y,x2,y2
@@ -612,6 +636,7 @@ def main():
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))
             else: time.sleep(1)
-        except requests.RequestException: LOG.exception('Kamerafel'); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
+        except CameraError as e: LOG.warning('Kamerafel: %s',e); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
+        except requests.RequestException as e: LOG.warning('Kamerafel: %s',safe_camera_error(e)); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
         except Exception: LOG.exception('Fel i övervakningsloopen'); publish(f'{BASE_TOPIC}/state/status','error',True); time.sleep(10)
 if __name__=='__main__': main()

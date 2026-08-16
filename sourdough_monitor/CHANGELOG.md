@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.1
+
+- Added automatic retry of transient RTSP frame failures.
+- Camera timeouts now keep the monitoring session active without noisy tracebacks.
+- RTSP timeout errors no longer expose the authenticated camera URL in logs.
+- Added configurable camera timeout and retry counts.
+
 ## 0.9.0
 
 - Added a Home Assistant temperature-sensor selector to every bake.
