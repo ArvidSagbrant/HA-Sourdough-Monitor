@@ -16,18 +16,26 @@ import requests
 
 LOG = logging.getLogger('sourdough')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+LOG_LEVELS={'error':logging.ERROR,'info':logging.INFO,'debug':logging.DEBUG}
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.9.1'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.9.2'
 MAX_PHOTO_BYTES=15*1024*1024; MAX_PHOTO_EDGE=2560
 
 class CameraError(RuntimeError): pass
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock(); photo_lock=threading.RLock()
-session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
+session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0; last_logged_status=None
 edge_history=deque(maxlen=5); last_growth_values=deque(maxlen=10); peak_growth=-1.0; peak_frame_path=None; start_frame_path=None; last_frame_path=None
 mqtt_client=None; cfg={}; active_bake_id=None; default_temperature_sensor_id=None
+
+def configure_logging(value):
+    name=str(value or 'info').strip().lower()
+    if name not in LOG_LEVELS:
+        LOG.warning('Okänd loggnivå %r; använder info',value); name='info'
+    LOG.setLevel(LOG_LEVELS[name])
+    return name
 
 SCHEMA='''
 PRAGMA journal_mode=WAL;
@@ -160,7 +168,7 @@ def create_bake(p):
     with db() as c:
         c.execute('''INSERT INTO bakes(id,name,status,started_at,recipe_json,process_json,bake_json,result_json,media_json,notes,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(bid,name,p.get('status','active'),p.get('started_at') or ts,*vals,p.get('notes',''),ts,ts))
-    active_bake_id=bid; persist_active_bake(); add_event(bid,'created',{'name':name}); publish_journal_state(); return get_bake(bid)
+    active_bake_id=bid; persist_active_bake(); add_event(bid,'created',{'name':name}); publish_journal_state(); LOG.info('Bak skapat och aktiverat: id=%s namn=%s',bid,name); return get_bake(bid)
 def update_bake(bid,p):
     cur=get_bake(bid); sets=[]; args=[]
     for k in ('name','status','started_at','finished_at','notes'):
@@ -176,11 +184,11 @@ def phase_bake(bid,phase,data=None):
     if phase not in keys: raise ValueError('Okänd fas')
     patch={'process':{keys[phase]:now_iso(), **(data or {})}}
     if phase=='baked': patch.update(status='finished',finished_at=now_iso())
-    out=update_bake(bid,patch); add_event(bid,phase,data or {}); return out
+    out=update_bake(bid,patch); add_event(bid,phase,data or {}); LOG.info('Bakfas uppdaterad: bak=%s fas=%s',bid,phase); return out
 def set_active_bake(bid):
     global active_bake_id
     if bid is not None: get_bake(bid)
-    active_bake_id=bid; persist_active_bake(); publish_journal_state()
+    active_bake_id=bid; persist_active_bake(); publish_journal_state(); LOG.info('Aktivt bak ändrat: bak=%s',bid or 'inget')
 def add_measurement(bid,session,growth,height,edge,conf,status,temperature=None,temperature_sensor=None):
     if not bid: return
     with db() as c: c.execute('INSERT INTO measurements(bake_id,session,ts,growth,height_px,edge_y,confidence,status,temperature_c,temperature_sensor) VALUES(?,?,?,?,?,?,?,?,?,?)',(bid,session,now_iso(),growth,height,edge,conf,status,temperature,temperature_sensor))
@@ -224,7 +232,7 @@ def add_bake_photo(bid,data,original_name='',caption='',featured=False):
             photos.append(photo); update_bake(bid,{'media':{'photos':photos}})
     except Exception:
         dest.unlink(missing_ok=True); raise
-    add_event(bid,'photo_added',{'id':photo_id,'filename':photo['filename'],'featured':photo['featured']})
+    add_event(bid,'photo_added',{'id':photo_id,'filename':photo['filename'],'featured':photo['featured']}); LOG.info('Foto tillagt: bak=%s foto=%s featured=%s',bid,photo_id,photo['featured'])
     return {**photo,'url':f"api/bakes/{quote(bid,safe='')}/photos/{quote(photo_id,safe='')}"}
 def set_featured_photo(bid,photo_id):
     with photo_lock:
@@ -232,7 +240,7 @@ def set_featured_photo(bid,photo_id):
         if not any(p.get('id')==photo_id for p in photos): raise KeyError(photo_id)
         for p in photos: p['featured']=p.get('id')==photo_id
         update_bake(bid,{'media':{'photos':photos}})
-    add_event(bid,'photo_featured',{'id':photo_id}); return bake_detail(bid)
+    add_event(bid,'photo_featured',{'id':photo_id}); LOG.info('Utvalt foto ändrat: bak=%s foto=%s',bid,photo_id); return bake_detail(bid)
 def delete_bake_photo(bid,photo_id):
     with photo_lock:
         bake=get_bake(bid); photos=[dict(p) for p in bake.get('media',{}).get('photos',[]) if isinstance(p,dict)]
@@ -240,7 +248,7 @@ def delete_bake_photo(bid,photo_id):
         update_bake(bid,{'media':{'photos':[p for p in photos if p.get('id')!=photo_id]}})
         try: photo_path(bid,photo_id).unlink(missing_ok=True)
         except OSError: LOG.exception('Kunde inte radera bildfil för %s',photo_id)
-    add_event(bid,'photo_deleted',{'id':photo_id})
+    add_event(bid,'photo_deleted',{'id':photo_id}); LOG.info('Foto raderat: bak=%s foto=%s',bid,photo_id)
 
 DETECTION_DEFAULTS={'blur_kernel':7,'sobel_kernel':3,'row_smoothing':9,'search_top_pct':5,'search_bottom_pct':95,'polarity':'both','candidate_count':4,'max_jump_pct':8}
 DETECTION_KEYS=set(DETECTION_DEFAULTS)
@@ -265,10 +273,12 @@ def current_detection():
 def save_detection_override(v):
     clean=validate_detection(v); tmp=DETECTION_OVERRIDE_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(clean,indent=2)); tmp.replace(DETECTION_OVERRIDE_PATH)
     with cfg_lock: cfg.update(clean)
+    LOG.info('Detektionsinställningar sparade')
     return clean
 def clear_detection_override():
     if DETECTION_OVERRIDE_PATH.exists(): DETECTION_OVERRIDE_PATH.unlink()
     with cfg_lock: cfg.update(DETECTION_DEFAULTS)
+    LOG.info('Detektionsinställningar återställda')
     return current_detection()
 def load_roi_override():
     try:
@@ -283,12 +293,14 @@ def current_roi():
 def save_roi_override(v):
     clean=validate_roi(v); tmp=ROI_OVERRIDE_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(clean,indent=2)); tmp.replace(ROI_OVERRIDE_PATH)
     with cfg_lock: cfg.update(clean)
+    LOG.info('ROI sparad: x=%s y=%s bredd=%s höjd=%s',clean['roi_x_pct'],clean['roi_y_pct'],clean['roi_width_pct'],clean['roi_height_pct'])
     return clean
 def clear_roi_override():
     if ROI_OVERRIDE_PATH.exists(): ROI_OVERRIDE_PATH.unlink()
     base=load_options()
     with cfg_lock:
         for k in ('roi_x_pct','roi_y_pct','roi_width_pct','roi_height_pct'): cfg[k]=base[k]
+    LOG.info('ROI återställd till add-on-konfigurationen')
     return current_roi()
 
 def supervisor_mqtt_service():
@@ -377,16 +389,19 @@ def safe_camera_error(value):
     password=str(cfg.get('camera_password','') or '')
     return text.replace(password,'***') if password else text
 def fetch_snapshot_frame():
+    LOG.debug('Hämtar snapshot-bildruta')
     try:
         auth=(cfg['camera_username'],cfg.get('camera_password','')) if cfg.get('camera_username') else None; r=requests.get(cfg['camera_url'],auth=auth,timeout=15); r.raise_for_status(); img=cv2.imdecode(np.frombuffer(r.content,np.uint8),cv2.IMREAD_COLOR)
     except requests.RequestException as e: raise CameraError(safe_camera_error(e)) from None
     if img is None: raise CameraError('Snapshot kunde inte avkodas')
+    LOG.debug('Snapshot-bildruta hämtad: bredd=%s höjd=%s',img.shape[1],img.shape[0])
     return img
 def fetch_rtsp_frame():
     timeout=max(5,int(cfg.get('camera_timeout_seconds',20))); attempts=1+max(0,int(cfg.get('camera_retries',1)))
     cmd=['ffmpeg','-hide_banner','-loglevel','error','-rtsp_transport',str(cfg.get('rtsp_transport','tcp')),'-i',camera_url_with_credentials(cfg['camera_url']),'-map','0:v:0','-frames:v','1','-f','image2pipe','-vcodec','mjpeg','pipe:1']
     last_error='okänt kamerafel'
     for attempt in range(1,attempts+1):
+        started=time.monotonic(); LOG.debug('Hämtar RTSP-bildruta: transport=%s försök=%s/%s timeout=%ss',cfg.get('rtsp_transport','tcp'),attempt,attempts,timeout)
         try:
             p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
             if p.returncode or not p.stdout:
@@ -394,7 +409,8 @@ def fetch_rtsp_frame():
                 last_error=('ffmpeg avslutades utan en bildruta'+(f': {detail[:500]}' if detail else ''))
             else:
                 img=cv2.imdecode(np.frombuffer(p.stdout,np.uint8),cv2.IMREAD_COLOR)
-                if img is not None:return img
+                if img is not None:
+                    LOG.debug('RTSP-bildruta hämtad: bredd=%s höjd=%s tid=%.2fs',img.shape[1],img.shape[0],time.monotonic()-started); return img
                 last_error='RTSP-bildrutan kunde inte avkodas'
         except subprocess.TimeoutExpired:
             last_error=f'RTSP-kameran svarade inte inom {timeout} sekunder'
@@ -478,10 +494,10 @@ def publish_timelapse_state(state,session=None,frames=None,duration_seconds=None
 def build_timelapse():
     global last_timelapse_build
     with session_lock: current=session_dir
-    if not current:return
+    if not current: LOG.debug('Timelapse hoppas över: ingen session'); return
     frames=sorted((current/'frames').glob('*.jpg'))
-    if len(frames)<2:return
-    out=current/'timelapse.mp4'; tmp=current/'timelapse.tmp.mp4'; fps=int(cfg['timelapse_fps']); subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-framerate',str(fps),'-i',str(current/'frames'/'%06d.jpg'),'-c:v','libx264','-preset','veryfast','-crf','22','-pix_fmt','yuv420p','-movflags','+faststart',str(tmp)],check=True); tmp.replace(out); latest=MEDIA_ROOT/'latest.mp4'; shutil.copy2(out,latest); publish_timelapse_state('ready',current.name,len(frames),len(frames)/max(1,fps),latest); last_timelapse_build=time.time()
+    if len(frames)<2: LOG.debug('Timelapse hoppas över: session=%s bilder=%s',current.name,len(frames)); return
+    out=current/'timelapse.mp4'; tmp=current/'timelapse.tmp.mp4'; fps=int(cfg['timelapse_fps']); LOG.info('Bygger timelapse: session=%s bilder=%s fps=%s',current.name,len(frames),fps); subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-framerate',str(fps),'-i',str(current/'frames'/'%06d.jpg'),'-c:v','libx264','-preset','veryfast','-crf','22','-pix_fmt','yuv420p','-movflags','+faststart',str(tmp)],check=True); tmp.replace(out); latest=MEDIA_ROOT/'latest.mp4'; shutil.copy2(out,latest); publish_timelapse_state('ready',current.name,len(frames),len(frames)/max(1,fps),latest); last_timelapse_build=time.time(); LOG.info('Timelapse klar: session=%s fil=%s',current.name,out.name)
     if active_bake_id: update_bake(active_bake_id,{'media':{'timelapse':media_uri(out),'session':current.name}})
 def finalize_keyframes_and_cleanup():
     with session_lock: current=session_dir; ss=start_frame_path; ps=peak_frame_path; es=last_frame_path
@@ -493,24 +509,25 @@ def finalize_keyframes_and_cleanup():
     if (current/'frames').exists(): shutil.rmtree(current/'frames',ignore_errors=True)
 def prune_sessions():
     sessions=sorted([p for p in MEDIA_ROOT.iterdir() if p.is_dir() and p.name.startswith('session_')],key=lambda p:p.stat().st_mtime,reverse=True)
-    for old in sessions[int(cfg['keep_sessions']):]: shutil.rmtree(old,ignore_errors=True)
+    for old in sessions[int(cfg['keep_sessions']):]: shutil.rmtree(old,ignore_errors=True); LOG.info('Gammal session raderad: session=%s',old.name)
 def start_session():
-    global session_active,session_dir,session_started,baseline_height_px,frame_no,last_timelapse_build,peak_growth,peak_frame_path,start_frame_path,last_frame_path
+    global session_active,session_dir,session_started,baseline_height_px,frame_no,last_timelapse_build,peak_growth,peak_frame_path,start_frame_path,last_frame_path,last_logged_status
     with session_lock:
-        if session_active:return
-        session_dir=MEDIA_ROOT/('session_'+datetime.now().strftime('%Y%m%d-%H%M%S')); (session_dir/'frames').mkdir(parents=True,exist_ok=True); session_started=datetime.now(); baseline_height_px=None; frame_no=0; edge_history.clear(); last_growth_values.clear(); peak_growth=-1.; peak_frame_path=start_frame_path=last_frame_path=None; session_active=True; last_timelapse_build=time.time(); persist_session()
+        if session_active: LOG.debug('Startkommando ignorerat: en session är redan aktiv'); return
+        session_dir=MEDIA_ROOT/('session_'+datetime.now().strftime('%Y%m%d-%H%M%S')); (session_dir/'frames').mkdir(parents=True,exist_ok=True); session_started=datetime.now(); baseline_height_px=None; frame_no=0; edge_history.clear(); last_growth_values.clear(); peak_growth=-1.; peak_frame_path=start_frame_path=last_frame_path=None; last_logged_status=None; session_active=True; last_timelapse_build=time.time(); persist_session()
     if active_bake_id: update_bake(active_bake_id,{'media':{'session':session_dir.name},'process':{'starter_monitor_started_at':now_iso()}})
-    publish(f'{BASE_TOPIC}/state/active','ON',True); publish(f'{BASE_TOPIC}/state/session',session_dir.name,True); publish(f'{BASE_TOPIC}/state/status','calibrating',True); publish_timelapse_state('recording',session_dir.name,0); prune_sessions()
+    publish(f'{BASE_TOPIC}/state/active','ON',True); publish(f'{BASE_TOPIC}/state/session',session_dir.name,True); publish(f'{BASE_TOPIC}/state/status','calibrating',True); publish_timelapse_state('recording',session_dir.name,0); LOG.info('Övervakningssession startad: session=%s aktivt_bak=%s',session_dir.name,active_bake_id or 'inget'); prune_sessions()
 def stop_session():
-    global session_active
+    global session_active,last_logged_status
     with session_lock: was=session_active; session_active=False; name=session_dir.name if session_dir else None; frames=frame_no; clear_persisted_session()
     if was:
         publish_timelapse_state('building',name,frames)
-        try: build_timelapse(); finalize_keyframes_and_cleanup(); publish(f'{BASE_TOPIC}/state/status','stopped',True)
+        try: build_timelapse(); finalize_keyframes_and_cleanup(); publish(f'{BASE_TOPIC}/state/status','stopped',True); LOG.info('Övervakningssession stoppad: session=%s bilder=%s',name,frames)
         except Exception: LOG.exception('Timelapse-bygge misslyckades'); publish_timelapse_state('error',name,frames)
-    publish(f'{BASE_TOPIC}/state/active','OFF',True)
+    else: LOG.debug('Stoppkommando ignorerat: ingen session är aktiv')
+    last_logged_status=None; publish(f'{BASE_TOPIC}/state/active','OFF',True)
 def process_frame():
-    global frame_no,baseline_height_px,peak_growth,peak_frame_path,start_frame_path,last_frame_path
+    global frame_no,baseline_height_px,peak_growth,peak_frame_path,start_frame_path,last_frame_path,last_logged_status
     img=fetch_frame(); edge,height,conf,roi,_=detect_top(img)
     with session_lock:
         if baseline_height_px is None: baseline_height_px=height
@@ -523,6 +540,8 @@ def process_frame():
     bid=active_bake_id; reading=None
     try: reading=bake_temperature(bid)
     except Exception: LOG.exception('Kunde inte läsa temperatursensorn för %s',bid)
+    if status!=last_logged_status: LOG.info('Surdegsstatus ändrad: session=%s status=%s tillväxt=%.1f%%',sname,status,growth); last_logged_status=status
+    LOG.debug('Bildruta bearbetad: session=%s bild=%s tillväxt=%.1f%% höjd=%spx kant_y=%s konfidens=%.2f temperatur=%s',sname,frame_no,growth,height,edge,conf,reading['temperature_c'] if reading else 'saknas')
     add_measurement(bid,sname,growth,height,edge,conf,status,reading and reading['temperature_c'],reading and reading['entity_id']); publish_timelapse_state('recording',sname,frame_no)
     if int(cfg['timelapse_refresh_minutes'])>0 and time.time()-last_timelapse_build>=int(cfg['timelapse_refresh_minutes'])*60:
         try: build_timelapse()
@@ -614,8 +633,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): LOG.debug('Web UI: '+fmt,*args)
 
 def start_web_ui():
-    s=ThreadingHTTPServer(('0.0.0.0',8099),Handler); threading.Thread(target=s.serve_forever,daemon=True).start(); return s
-def on_connect(client,userdata,flags,reason_code,properties=None): client.subscribe(f'{BASE_TOPIC}/cmd/#'); publish_discovery(); publish(f'{BASE_TOPIC}/state/active','ON' if session_active else 'OFF',True)
+    s=ThreadingHTTPServer(('0.0.0.0',8099),Handler); threading.Thread(target=s.serve_forever,daemon=True).start(); LOG.info('Webbgränssnitt startat: port=8099'); return s
+def on_connect(client,userdata,flags,reason_code,properties=None):
+    if getattr(reason_code,'is_failure',False): LOG.error('MQTT-anslutning misslyckades: %s',reason_code); return
+    client.subscribe(f'{BASE_TOPIC}/cmd/#'); publish_discovery(); publish(f'{BASE_TOPIC}/state/active','ON' if session_active else 'OFF',True); LOG.info('MQTT ansluten och discovery publicerad')
+def on_disconnect(client,userdata,disconnect_flags,reason_code,properties=None):
+    if str(reason_code) not in {'0','Success','Normal disconnection'}: LOG.warning('MQTT frånkopplad: %s',reason_code)
+    else: LOG.info('MQTT frånkopplad')
 def on_message(client,userdata,msg):
     if msg.payload.decode(errors='replace')!='PRESS':return
     if msg.topic.endswith('/start'):threading.Thread(target=start_session,daemon=True).start()
@@ -626,17 +650,17 @@ def setup_mqtt():
     host,port,user,password,ssl=get_mqtt_service(); c=mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,client_id='sourdough-monitor',clean_session=True)
     if user:c.username_pw_set(user,password)
     if ssl:c.tls_set()
-    c.will_set(f'{BASE_TOPIC}/availability','offline',retain=True); c.on_connect=on_connect; c.on_message=on_message; c.connect(host,port,60); c.loop_start(); mqtt_client=c
-    LOG.info('Ansluten till MQTT på %s:%s',host,port)
+    c.will_set(f'{BASE_TOPIC}/availability','offline',retain=True); c.on_connect=on_connect; c.on_disconnect=on_disconnect; c.on_message=on_message; c.connect(host,port,60); c.loop_start(); mqtt_client=c
+    LOG.info('MQTT-anslutning initierad: värd=%s port=%s tls=%s',host,port,ssl)
 
 def main():
     global cfg,edge_history
-    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); load_default_temperature_sensor(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); restore_session(); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
+    cfg=load_options(); log_level=configure_logging(cfg.get('log_level','info')); LOG.info('Startar Sourdough Monitor %s: loggnivå=%s kamerakälla=%s intervall=%ss',VERSION,log_level,cfg.get('camera_source','snapshot'),cfg.get('interval_seconds',60)); MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); load_default_temperature_sensor(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); restore_session(); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor redo')
     while True:
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))
             else: time.sleep(1)
-        except CameraError as e: LOG.warning('Kamerafel: %s',e); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
-        except requests.RequestException as e: LOG.warning('Kamerafel: %s',safe_camera_error(e)); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
+        except CameraError as e: LOG.error('Kamerafel: %s',e); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
+        except requests.RequestException as e: LOG.error('Kamerafel: %s',safe_camera_error(e)); publish(f'{BASE_TOPIC}/state/status','camera_error',True); time.sleep(10)
         except Exception: LOG.exception('Fel i övervakningsloopen'); publish(f'{BASE_TOPIC}/state/status','error',True); time.sleep(10)
 if __name__=='__main__': main()
