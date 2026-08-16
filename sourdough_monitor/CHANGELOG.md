@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Added a Home Assistant temperature-sensor selector to every bake.
+- Added a persistent default temperature sensor that is automatically assigned to new bakes.
+- Live sensor temperature now replaces the manual bulk-temperature display when a sensor is selected.
+- Temperature readings are stored together with monitoring measurements, including min, average, and max summaries.
+- Added a prominent current-stage indicator, timestamped phase controls, and a stage history for every bake.
+- Added current bake stage and stage-change time to the active-bake MQTT attributes.
+
 ## 0.8.0
 
 - Added solid black backgrounds behind OpenCV overlay labels for consistent text contrast.

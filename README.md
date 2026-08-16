@@ -25,6 +25,8 @@ The add-on also includes a bake journal for keeping recipes, fermentation milest
 - Includes a persistent bake journal with:
   - flour, water, starter, and salt quantities;
   - dough temperature, target bulk rise, bulk temperature, and cold-proof duration;
+  - an optional Home Assistant temperature sensor with live values and recorded temperature history;
+  - a prominent current stage and timestamped stage history;
   - timestamps for starter use, bulk fermentation, proofing, and baking;
   - ratings for oven spring, crumb, crust, and flavour;
   - notes, derived hydration and whole-grain percentages, and measurement summaries;
@@ -134,11 +136,12 @@ If detection jumps to the jar rim, narrow the ROI or search interval first. Then
 
 1. Select **Bakjournal** (**Bake journal**) and create a new bake.
 2. Enter the recipe and any known process targets, then save it.
-3. Make sure the intended bake is marked as active. New bakes become active automatically; an older bake can be selected with **Gör aktivt** (**Make active**).
-4. Use the phase buttons as the bake progresses to record timestamps.
-5. Add notes, result ratings, and process or final-loaf photos when convenient.
+3. Optionally select a Home Assistant temperature sensor. Its live value replaces the manual bulk-temperature field, and readings are saved with camera measurements. Enable **Använd som standardsensor för nya bak** to assign it automatically to future bakes.
+4. Make sure the intended bake is marked as active. New bakes become active automatically; an older bake can be selected with **Gör aktivt** (**Make active**).
+5. Use the phase buttons as the bake progresses. The current stage and the time of every stage change are shown in the journal.
+6. Add notes, result ratings, and process or final-loaf photos when convenient.
 
-Only measurements taken while a bake is active are associated with that bake.
+Only measurements taken while a bake is active are associated with that bake. Temperature values are recorded on the same interval as the camera measurements. If no temperature sensor is selected, the bulk temperature remains a manual journal field.
 
 ### 4. Monitor the starter
 

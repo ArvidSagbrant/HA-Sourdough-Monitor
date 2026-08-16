@@ -19,13 +19,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.8.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.9.0'
 MAX_PHOTO_BYTES=15*1024*1024; MAX_PHOTO_EDGE=2560
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock(); photo_lock=threading.RLock()
 session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
 edge_history=deque(maxlen=5); last_growth_values=deque(maxlen=10); peak_growth=-1.0; peak_frame_path=None; start_frame_path=None; last_frame_path=None
-mqtt_client=None; cfg={}; active_bake_id=None
+mqtt_client=None; cfg={}; active_bake_id=None; default_temperature_sensor_id=None
 
 SCHEMA='''
 PRAGMA journal_mode=WAL;
@@ -34,12 +34,20 @@ CREATE TABLE IF NOT EXISTS bakes (
  recipe_json TEXT NOT NULL DEFAULT '{}', process_json TEXT NOT NULL DEFAULT '{}', bake_json TEXT NOT NULL DEFAULT '{}',
  result_json TEXT NOT NULL DEFAULT '{}', media_json TEXT NOT NULL DEFAULT '{}', notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, bake_id TEXT NOT NULL, kind TEXT NOT NULL, ts TEXT NOT NULL, data_json TEXT NOT NULL DEFAULT '{}');
-CREATE TABLE IF NOT EXISTS measurements (seq INTEGER PRIMARY KEY AUTOINCREMENT, bake_id TEXT NOT NULL, session TEXT, ts TEXT NOT NULL, growth REAL, height_px INTEGER, edge_y INTEGER, confidence REAL, status TEXT);
+CREATE TABLE IF NOT EXISTS measurements (seq INTEGER PRIMARY KEY AUTOINCREMENT, bake_id TEXT NOT NULL, session TEXT, ts TEXT NOT NULL, growth REAL, height_px INTEGER, edge_y INTEGER, confidence REAL, status TEXT, temperature_c REAL, temperature_sensor TEXT);
 CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_bake_ts ON events(bake_id,ts);
 CREATE INDEX IF NOT EXISTS idx_measurements_bake_ts ON measurements(bake_id,ts);
 '''
 JSON_COLS=('recipe','process','bake','result','media')
+PHASES=(
+    ('starter_used','starter_used_at','Degblandning'),
+    ('bulk_start','bulk_start','Bulkjäsning'),
+    ('bulk_end','bulk_end','Formning'),
+    ('proof_start','proof_start','Slutjäsning'),
+    ('proof_end','proof_end','Redo att baka'),
+    ('baked','baked_at','Bakad'),
+)
 
 def now_iso(): return datetime.now().astimezone().isoformat(timespec='seconds')
 @contextmanager
@@ -49,7 +57,11 @@ def db():
     finally: c.close()
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with db() as c: c.executescript(SCHEMA)
+    with db() as c:
+        c.executescript(SCHEMA)
+        columns={r['name'] for r in c.execute('PRAGMA table_info(measurements)').fetchall()}
+        if 'temperature_c' not in columns: c.execute('ALTER TABLE measurements ADD COLUMN temperature_c REAL')
+        if 'temperature_sensor' not in columns: c.execute('ALTER TABLE measurements ADD COLUMN temperature_sensor TEXT')
 def load_active_bake():
     global active_bake_id
     with db() as c: row=c.execute("SELECT value FROM app_state WHERE key='active_bake_id'").fetchone()
@@ -61,6 +73,19 @@ def persist_active_bake():
     with db() as c:
         if active_bake_id is None: c.execute("DELETE FROM app_state WHERE key='active_bake_id'")
         else: c.execute("INSERT INTO app_state(key,value) VALUES('active_bake_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(active_bake_id,))
+def load_default_temperature_sensor():
+    global default_temperature_sensor_id
+    with db() as c: row=c.execute("SELECT value FROM app_state WHERE key='default_temperature_sensor_id'").fetchone()
+    default_temperature_sensor_id=row['value'] if row else None
+def set_default_temperature_sensor(entity_id):
+    global default_temperature_sensor_id
+    entity_id=str(entity_id or '').strip() or None
+    if entity_id and (not entity_id.startswith('sensor.') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.' for c in entity_id)): raise ValueError('Ogiltigt sensor-id')
+    default_temperature_sensor_id=entity_id
+    with db() as c:
+        if entity_id is None: c.execute("DELETE FROM app_state WHERE key='default_temperature_sensor_id'")
+        else: c.execute("INSERT INTO app_state(key,value) VALUES('default_temperature_sensor_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(entity_id,))
+    return default_temperature_sensor_id
 def persist_session():
     if not session_active or not session_dir: return
     state={'dir':session_dir.name,'started_at':session_started.isoformat() if session_started else None,
@@ -96,6 +121,17 @@ def decode_bake(r):
     d=dict(r)
     for k in JSON_COLS: d[k]=json.loads(d.pop(k+'_json') or '{}')
     return d
+def bake_stage(bake):
+    stage={'key':'planning','label':'Planering','changed_at':bake.get('started_at')}
+    process=bake.get('process') or {}
+    history=[]
+    for phase,key,label in PHASES:
+        if process.get(key):
+            stage={'key':phase,'label':label,'changed_at':process[key]}
+            history.append({**stage})
+    return stage,history
+def enrich_bake(bake):
+    stage,history=bake_stage(bake); bake['stage']=stage; bake['stage_history']=history; return bake
 def next_bake_id():
     day=datetime.now().astimezone().date().isoformat()
     with db() as c: rows=c.execute('SELECT id FROM bakes WHERE id LIKE ?', (day+'-%',)).fetchall()
@@ -112,11 +148,13 @@ def get_bake(bid):
     return decode_bake(r)
 def list_bakes(limit=50):
     with db() as c: rows=c.execute('SELECT * FROM bakes ORDER BY started_at DESC LIMIT ?', (limit,)).fetchall()
-    return [decode_bake(r) for r in rows]
+    return [enrich_bake(decode_bake(r)) for r in rows]
 def create_bake(p):
     global active_bake_id
     ts=now_iso(); bid=p.get('id') or next_bake_id(); name=(p.get('name') or 'Nytt surdegsbröd').strip()
-    vals=[json.dumps(p.get(k) or {},ensure_ascii=False) for k in JSON_COLS]
+    payload=dict(p); process=dict(payload.get('process') or {})
+    if 'temperature_sensor_entity_id' not in process and default_temperature_sensor_id: process['temperature_sensor_entity_id']=default_temperature_sensor_id
+    payload['process']=process; vals=[json.dumps(payload.get(k) or {},ensure_ascii=False) for k in JSON_COLS]
     with db() as c:
         c.execute('''INSERT INTO bakes(id,name,status,started_at,recipe_json,process_json,bake_json,result_json,media_json,notes,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(bid,name,p.get('status','active'),p.get('started_at') or ts,*vals,p.get('notes',''),ts,ts))
@@ -132,7 +170,7 @@ def update_bake(bid,p):
     with db() as c: c.execute('UPDATE bakes SET '+', '.join(sets)+' WHERE id=?',args)
     add_event(bid,'updated',p); publish_journal_state(); return get_bake(bid)
 def phase_bake(bid,phase,data=None):
-    keys={'starter_used':'starter_used_at','bulk_start':'bulk_start','bulk_end':'bulk_end','proof_start':'proof_start','proof_end':'proof_end','baked':'baked_at'}
+    keys={phase:key for phase,key,_ in PHASES}
     if phase not in keys: raise ValueError('Okänd fas')
     patch={'process':{keys[phase]:now_iso(), **(data or {})}}
     if phase=='baked': patch.update(status='finished',finished_at=now_iso())
@@ -141,16 +179,20 @@ def set_active_bake(bid):
     global active_bake_id
     if bid is not None: get_bake(bid)
     active_bake_id=bid; persist_active_bake(); publish_journal_state()
-def add_measurement(bid,session,growth,height,edge,conf,status):
+def add_measurement(bid,session,growth,height,edge,conf,status,temperature=None,temperature_sensor=None):
     if not bid: return
-    with db() as c: c.execute('INSERT INTO measurements(bake_id,session,ts,growth,height_px,edge_y,confidence,status) VALUES(?,?,?,?,?,?,?,?)',(bid,session,now_iso(),growth,height,edge,conf,status))
+    with db() as c: c.execute('INSERT INTO measurements(bake_id,session,ts,growth,height_px,edge_y,confidence,status,temperature_c,temperature_sensor) VALUES(?,?,?,?,?,?,?,?,?,?)',(bid,session,now_iso(),growth,height,edge,conf,status,temperature,temperature_sensor))
 def bake_detail(bid):
-    out=get_bake(bid)
+    out=enrich_bake(get_bake(bid))
     with db() as c:
         out['events']=[dict(r) for r in c.execute('SELECT seq,kind,ts,data_json FROM events WHERE bake_id=? ORDER BY ts',(bid,)).fetchall()]
         for e in out['events']: e['data']=json.loads(e.pop('data_json') or '{}')
-        m=c.execute('SELECT COUNT(*) n, MIN(growth) min_growth, MAX(growth) max_growth, AVG(growth) avg_growth FROM measurements WHERE bake_id=?',(bid,)).fetchone()
+        m=c.execute('SELECT COUNT(*) n, MIN(growth) min_growth, MAX(growth) max_growth, AVG(growth) avg_growth, COUNT(temperature_c) temperature_n, MIN(temperature_c) min_temperature_c, MAX(temperature_c) max_temperature_c, AVG(temperature_c) avg_temperature_c, (SELECT temperature_c FROM measurements latest WHERE latest.bake_id=? AND temperature_c IS NOT NULL ORDER BY ts DESC, seq DESC LIMIT 1) latest_temperature_c, (SELECT ts FROM measurements latest WHERE latest.bake_id=? AND temperature_c IS NOT NULL ORDER BY ts DESC, seq DESC LIMIT 1) latest_temperature_at FROM measurements WHERE bake_id=?',(bid,bid,bid)).fetchone()
         out['measurement_summary']=dict(m)
+    sensor=(out.get('process') or {}).get('temperature_sensor_entity_id')
+    if sensor:
+        try: out['temperature']=read_temperature_sensor(sensor)
+        except Exception as e: out['temperature']={'entity_id':sensor,'available':False,'error':str(e)}
     for photo in out.get('media',{}).get('photos',[]):
         photo['url']=f"api/bakes/{quote(bid,safe='')}/photos/{quote(str(photo.get('id','')),safe='')}"
     return out
@@ -255,6 +297,37 @@ def supervisor_mqtt_service():
     if body.get('result')!='ok': raise RuntimeError(body.get('message') or 'MQTT-tjänsten kunde inte hämtas')
     data=body.get('data') or {}
     return str(data['host']),int(data.get('port',1883)),str(data.get('username','') or ''),str(data.get('password','') or ''),bool(data.get('ssl',False))
+def home_assistant_headers():
+    token=os.environ.get('SUPERVISOR_TOKEN')
+    if not token: raise RuntimeError('SUPERVISOR_TOKEN saknas')
+    return {'Authorization':f'Bearer {token}','Content-Type':'application/json'}
+def temperature_c(value,unit):
+    value=float(value); normalized=str(unit or '').strip().replace('°','').upper()
+    if normalized in {'F','℉'}: return (value-32)*5/9
+    if normalized=='K': return value-273.15
+    return value
+def temperature_sensor_from_state(state):
+    entity_id=str(state.get('entity_id') or ''); attributes=state.get('attributes') or {}; unit=attributes.get('unit_of_measurement') or ''
+    if not entity_id.startswith('sensor.') or attributes.get('device_class')!='temperature': raise ValueError('Entiteten är inte en temperatursensor')
+    try: value=round(temperature_c(state.get('state'),unit),2)
+    except (TypeError,ValueError): raise ValueError('Temperatursensorn saknar ett numeriskt värde')
+    return {'entity_id':entity_id,'name':attributes.get('friendly_name') or entity_id,'temperature_c':value,'source_value':state.get('state'),'source_unit':unit,'updated_at':state.get('last_updated') or state.get('last_changed'),'available':True}
+def list_temperature_sensors():
+    r=requests.get('http://supervisor/core/api/states',headers=home_assistant_headers(),timeout=10); r.raise_for_status(); sensors=[]
+    for state in r.json():
+        try: sensors.append(temperature_sensor_from_state(state))
+        except ValueError: pass
+    return sorted(sensors,key=lambda sensor:sensor['name'].casefold())
+def read_temperature_sensor(entity_id):
+    entity_id=str(entity_id or '').strip()
+    if not entity_id.startswith('sensor.') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.' for c in entity_id): raise ValueError('Ogiltigt sensor-id')
+    r=requests.get('http://supervisor/core/api/states/'+quote(entity_id,safe=''),headers=home_assistant_headers(),timeout=10); r.raise_for_status()
+    return temperature_sensor_from_state(r.json())
+def bake_temperature(bid):
+    if not bid: return None
+    sensor=(get_bake(bid).get('process') or {}).get('temperature_sensor_entity_id')
+    if not sensor: return None
+    return read_temperature_sensor(sensor)
 def get_mqtt_service():
     host=str(cfg.get('mqtt_host','') or '').strip()
     if not host: return supervisor_mqtt_service()
@@ -284,7 +357,9 @@ def publish_discovery():
     publish(av,'online',True); publish_journal_state()
 def publish_journal_state():
     if active_bake_id:
-        try: b=get_bake(active_bake_id); publish(f'{BASE_TOPIC}/state/active_bake',b['name'],True); publish(f'{BASE_TOPIC}/attributes/active_bake',{'id':b['id'],'status':b['status'],'started_at':b['started_at']},True); return
+        try:
+            b=get_bake(active_bake_id); stage,_=bake_stage(b); process=b.get('process') or {}
+            publish(f'{BASE_TOPIC}/state/active_bake',b['name'],True); publish(f'{BASE_TOPIC}/attributes/active_bake',{'id':b['id'],'status':b['status'],'started_at':b['started_at'],'stage':stage['label'],'stage_key':stage['key'],'stage_changed_at':stage['changed_at'],'temperature_sensor_entity_id':process.get('temperature_sensor_entity_id')},True); return
         except KeyError: pass
     publish(f'{BASE_TOPIC}/state/active_bake','none',True); publish(f'{BASE_TOPIC}/attributes/active_bake',{},True)
 
@@ -421,7 +496,10 @@ def process_frame():
         last_frame_path=fp; frame_no+=1; persist_session(); cv2.imwrite(str(MEDIA_ROOT/'latest.jpg'),ann,[cv2.IMWRITE_JPEG_QUALITY,88]); ok,enc=cv2.imencode('.jpg',ann,[cv2.IMWRITE_JPEG_QUALITY,88]); elapsed=int((datetime.now()-session_started).total_seconds()/60) if session_started else 0; sname=session_dir.name
     if ok: publish_binary(f'{BASE_TOPIC}/image/preview',enc.tobytes(),True)
     for k,v in [('growth',f'{growth:.1f}'),('height',height),('edge_y',edge),('frames',frame_no),('elapsed',elapsed),('status',status)]: publish(f'{BASE_TOPIC}/state/{k}',str(v),True)
-    add_measurement(active_bake_id,sname,growth,height,edge,conf,status); publish_timelapse_state('recording',sname,frame_no)
+    bid=active_bake_id; reading=None
+    try: reading=bake_temperature(bid)
+    except Exception: LOG.exception('Kunde inte läsa temperatursensorn för %s',bid)
+    add_measurement(bid,sname,growth,height,edge,conf,status,reading and reading['temperature_c'],reading and reading['entity_id']); publish_timelapse_state('recording',sname,frame_no)
     if int(cfg['timelapse_refresh_minutes'])>0 and time.time()-last_timelapse_build>=int(cfg['timelapse_refresh_minutes'])*60:
         try: build_timelapse()
         except: LOG.exception('Periodiskt timelapse-bygge misslyckades')
@@ -441,7 +519,10 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path.rstrip('/'); qs=parse_qs(urlparse(self.path).query)
         if path in {'','/'}:
             data=UI_PATH.read_bytes(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(data))); self.end_headers(); return self.wfile.write(data)
-        if path.endswith('/api/config') or path=='/api/config': return self._json(200,{'camera_source':cfg.get('camera_source'),'camera_url':cfg.get('camera_url'),**current_roi(),'override_active':ROI_OVERRIDE_PATH.exists(),'active_bake_id':active_bake_id,'session_active':session_active})
+        if path.endswith('/api/config') or path=='/api/config': return self._json(200,{'camera_source':cfg.get('camera_source'),'camera_url':cfg.get('camera_url'),**current_roi(),'override_active':ROI_OVERRIDE_PATH.exists(),'active_bake_id':active_bake_id,'session_active':session_active,'default_temperature_sensor_entity_id':default_temperature_sensor_id})
+        if path.endswith('/api/temperature-sensors') or path=='/api/temperature-sensors':
+            try:return self._json(200,list_temperature_sensors())
+            except Exception as e: LOG.exception('Kunde inte hämta temperatursensorer'); return self._json(502,{'error':str(e)})
         if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,{**current_detection(),'override_active':DETECTION_OVERRIDE_PATH.exists()})
         if path.endswith('/api/detection-preview.jpg') or path=='/api/detection-preview.jpg':
             try:
@@ -470,6 +551,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.endswith('/api/roi') or path=='/api/roi': return self._json(200,save_roi_override(self._body()))
             if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,save_detection_override(self._body()))
+            if path.endswith('/api/default-temperature-sensor') or path=='/api/default-temperature-sensor': return self._json(200,{'default_temperature_sensor_entity_id':set_default_temperature_sensor(self._body().get('id'))})
             if path.endswith('/api/bakes') or path=='/api/bakes': return self._json(201,create_bake(self._body()))
             if '/api/bakes/' in path and path.endswith('/photos'):
                 bid=unquote(path.split('/api/bakes/',1)[1].rsplit('/photos',1)[0]); n=int(self.headers.get('Content-Length','0'))
@@ -525,7 +607,7 @@ def setup_mqtt():
 
 def main():
     global cfg,edge_history
-    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); restore_session(); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
+    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); load_default_temperature_sensor(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); restore_session(); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
     while True:
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))

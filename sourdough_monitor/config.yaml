@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: "Sourdough Monitor"
-version: "0.8.0"
+version: "0.9.0"
 slug: "sourdough_monitor"
 description: "Monitor a sourdough starter with IP Webcam, OpenCV, MQTT Discovery and automatic timelapse."
 url: "https://github.com/ArvidSagbrant/HA-Sourdough-Monitor"
