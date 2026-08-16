@@ -1,3 +1,6 @@
+# Copyright 2026 Arvid Sagbrant
+# SPDX-License-Identifier: Apache-2.0
+
 name: "Sourdough Monitor"
 version: "0.7.0"
 slug: "sourdough_monitor"
