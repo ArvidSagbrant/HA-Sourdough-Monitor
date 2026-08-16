@@ -86,6 +86,7 @@ The MQTT connection is normally obtained automatically from Home Assistant's MQT
 
 | Option | Default | Description |
 | --- | --- | --- |
+| `log_level` | `info` | Logging detail: `error`, `info`, or `debug`. |
 | `camera_source` | `snapshot` | Camera input type: `snapshot` or `rtsp`. |
 | `camera_url` | `http://192.168.1.100/snapshot.jpg` | Snapshot or RTSP URL. |
 | `camera_username` | empty | Optional camera username. |
@@ -109,6 +110,8 @@ The MQTT connection is normally obtained automatically from Home Assistant's MQT
 | `keep_sessions` | `10` | Maximum number of monitoring session directories to retain. |
 
 ROI and detection settings saved in the web UI take effect immediately and override the corresponding add-on configuration values where applicable.
+
+At `error`, only failures are logged. `info` also records normal lifecycle events such as startup, MQTT connection, session start and stop, sourdough status changes, bake phases, and timelapse creation. `debug` additionally logs camera fetch attempts, frame measurements, and web requests. The added log entries do not include camera URLs or MQTT credentials.
 
 ## Quick start and basic usage
 

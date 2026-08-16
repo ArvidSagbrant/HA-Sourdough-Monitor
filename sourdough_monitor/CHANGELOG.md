@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.2
+
+- Added configurable `error`, `info`, and `debug` logging with normal lifecycle events at the default `info` level.
+
 ## 0.9.1
 
 - Added automatic retry of transient RTSP frame failures.
