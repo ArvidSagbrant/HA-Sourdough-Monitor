@@ -1,6 +1,6 @@
 # HA Sourdough Monitor
 
-Ett lokalt Home Assistant-tillägg som övervakar en surdegsstarter med en nätverkskamera, OpenCV och MQTT Discovery. Tillägget innehåller även en bakjournal och skapar keyframes samt timelapse-videor.
+Ett lokalt Home Assistant-tillägg som övervakar en surdegsstarter med en nätverkskamera, OpenCV och MQTT Discovery. Tillägget innehåller även en bakjournal med fotodokumentation och skapar keyframes samt timelapse-videor.
 
 ## Installation som add-on repository
 
@@ -29,7 +29,8 @@ Under **Kamera & detektion → Detektionslabb** kan OpenCV-inställningarna prov
 - Journalen sparas beständigt i `/data/sourdough_journal.db`.
 - ROI-justeringar sparas i `/data/roi.json`.
 - Detektionsjusteringar sparas i `/data/detection.json`.
-- Bilder och timelapse sparas under `/media/sourdough`.
+- Uppladdade bakbilder, kamerabilder och timelapse sparas under `/media/sourdough`.
+- Varje bak kan ha flera foton. Ett foto kan markeras som slutbild och visas först i galleriet.
 - Äldre sessioner begränsas med inställningen `keep_sessions`.
 - En aktiv övervakningssession återupptas automatiskt efter omstart med samma starttid, baslinje och bildsekvens. En session som stoppats manuellt förblir stoppad.
 

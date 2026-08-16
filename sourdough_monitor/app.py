@@ -1,10 +1,10 @@
-import json, logging, os, shutil, sqlite3, statistics, subprocess, threading, time
+import hashlib, json, logging, os, shutil, sqlite3, statistics, subprocess, threading, time, uuid
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit, urlparse, parse_qs
+from urllib.parse import quote, unquote, urlsplit, urlunsplit, urlparse, parse_qs
 
 import cv2
 import numpy as np
@@ -16,9 +16,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.6.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.7.0'
+MAX_PHOTO_BYTES=15*1024*1024; MAX_PHOTO_EDGE=2560
 
-session_lock=threading.Lock(); cfg_lock=threading.RLock()
+session_lock=threading.Lock(); cfg_lock=threading.RLock(); photo_lock=threading.RLock()
 session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
 edge_history=deque(maxlen=5); last_growth_values=deque(maxlen=10); peak_growth=-1.0; peak_frame_path=None; start_frame_path=None; last_frame_path=None
 mqtt_client=None; cfg={}; active_bake_id=None
@@ -147,7 +148,52 @@ def bake_detail(bid):
         for e in out['events']: e['data']=json.loads(e.pop('data_json') or '{}')
         m=c.execute('SELECT COUNT(*) n, MIN(growth) min_growth, MAX(growth) max_growth, AVG(growth) avg_growth FROM measurements WHERE bake_id=?',(bid,)).fetchone()
         out['measurement_summary']=dict(m)
+    for photo in out.get('media',{}).get('photos',[]):
+        photo['url']=f"api/bakes/{quote(bid,safe='')}/photos/{quote(str(photo.get('id','')),safe='')}"
     return out
+
+def bake_photo_dir(bid):
+    return MEDIA_ROOT/'bakes'/hashlib.sha256(bid.encode()).hexdigest()[:20]
+def photo_path(bid,photo_id):
+    if not photo_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' for c in photo_id): raise ValueError('Ogiltigt foto-id')
+    return bake_photo_dir(bid)/(photo_id+'.jpg')
+def add_bake_photo(bid,data,original_name='',caption='',featured=False):
+    if not data: raise ValueError('Bilden är tom')
+    if len(data)>MAX_PHOTO_BYTES: raise ValueError('Bilden är för stor (max 15 MB)')
+    get_bake(bid); img=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
+    if img is None: raise ValueError('Filen kunde inte läsas som en bild')
+    h,w=img.shape[:2]; scale=min(1.0,MAX_PHOTO_EDGE/max(h,w))
+    if scale<1: img=cv2.resize(img,(max(1,round(w*scale)),max(1,round(h*scale))),interpolation=cv2.INTER_AREA)
+    h,w=img.shape[:2]; photo_id=datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8]
+    folder=bake_photo_dir(bid); folder.mkdir(parents=True,exist_ok=True); dest=photo_path(bid,photo_id); tmp=dest.with_suffix('.tmp.jpg')
+    if not cv2.imwrite(str(tmp),img,[cv2.IMWRITE_JPEG_QUALITY,88]): raise RuntimeError('Bilden kunde inte sparas')
+    tmp.replace(dest)
+    photo={'id':photo_id,'filename':original_name[:200] or 'photo.jpg','caption':caption[:500],'featured':bool(featured),'uploaded_at':now_iso(),'width':w,'height':h,'media_content_id':media_uri(dest)}
+    try:
+        with photo_lock:
+            bake=get_bake(bid); photos=[dict(p) for p in bake.get('media',{}).get('photos',[]) if isinstance(p,dict)]
+            if featured:
+                for p in photos: p['featured']=False
+            photos.append(photo); update_bake(bid,{'media':{'photos':photos}})
+    except Exception:
+        dest.unlink(missing_ok=True); raise
+    add_event(bid,'photo_added',{'id':photo_id,'filename':photo['filename'],'featured':photo['featured']})
+    return {**photo,'url':f"api/bakes/{quote(bid,safe='')}/photos/{quote(photo_id,safe='')}"}
+def set_featured_photo(bid,photo_id):
+    with photo_lock:
+        bake=get_bake(bid); photos=[dict(p) for p in bake.get('media',{}).get('photos',[]) if isinstance(p,dict)]
+        if not any(p.get('id')==photo_id for p in photos): raise KeyError(photo_id)
+        for p in photos: p['featured']=p.get('id')==photo_id
+        update_bake(bid,{'media':{'photos':photos}})
+    add_event(bid,'photo_featured',{'id':photo_id}); return bake_detail(bid)
+def delete_bake_photo(bid,photo_id):
+    with photo_lock:
+        bake=get_bake(bid); photos=[dict(p) for p in bake.get('media',{}).get('photos',[]) if isinstance(p,dict)]
+        if not any(p.get('id')==photo_id for p in photos): raise KeyError(photo_id)
+        update_bake(bid,{'media':{'photos':[p for p in photos if p.get('id')!=photo_id]}})
+        try: photo_path(bid,photo_id).unlink(missing_ok=True)
+        except OSError: LOG.exception('Kunde inte radera bildfil för %s',photo_id)
+    add_event(bid,'photo_deleted',{'id':photo_id})
 
 DETECTION_DEFAULTS={'blur_kernel':7,'sobel_kernel':3,'row_smoothing':9,'search_top_pct':5,'search_bottom_pct':95,'polarity':'both','candidate_count':4,'max_jump_pct':8}
 DETECTION_KEYS=set(DETECTION_DEFAULTS)
@@ -373,6 +419,10 @@ class Handler(BaseHTTPRequestHandler):
         data=json.dumps(obj,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
     def _body(self):
         n=int(self.headers.get('Content-Length','0')); return json.loads(self.rfile.read(n) or b'{}')
+    def _photo(self,bid,photo_id):
+        bake=get_bake(bid)
+        if not any(isinstance(p,dict) and p.get('id')==photo_id for p in bake.get('media',{}).get('photos',[])): raise KeyError(photo_id)
+        data=photo_path(bid,photo_id).read_bytes(); self.send_response(200); self.send_header('Content-Type','image/jpeg'); self.send_header('Cache-Control','private, max-age=86400'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         if not self._allowed(): return self.send_error(403)
         path=urlparse(self.path).path.rstrip('/'); qs=parse_qs(urlparse(self.path).query)
@@ -391,8 +441,12 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.exception("RTSP/Preview misslyckades")
                 return self.send_error(502,str(e)) 
         if path.endswith('/api/bakes') or path=='/api/bakes': return self._json(200,list_bakes(min(int(qs.get('limit',['50'])[0]),200)))
+        if '/api/bakes/' in path and '/photos/' in path:
+            rest=path.split('/api/bakes/',1)[1]; bid,photo_id=map(unquote,rest.split('/photos/',1))
+            try:return self._photo(bid,photo_id)
+            except (KeyError,FileNotFoundError,ValueError):return self._json(404,{'error':'not_found'})
         if '/api/bakes/' in path:
-            bid=path.split('/api/bakes/',1)[1].split('/')[0]
+            bid=unquote(path.split('/api/bakes/',1)[1].split('/')[0])
             try:return self._json(200,bake_detail(bid))
             except KeyError:return self._json(404,{'error':'not_found'})
         return self.send_error(404)
@@ -404,6 +458,13 @@ class Handler(BaseHTTPRequestHandler):
             if path.endswith('/api/roi') or path=='/api/roi': return self._json(200,save_roi_override(self._body()))
             if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,save_detection_override(self._body()))
             if path.endswith('/api/bakes') or path=='/api/bakes': return self._json(201,create_bake(self._body()))
+            if '/api/bakes/' in path and path.endswith('/photos'):
+                bid=unquote(path.split('/api/bakes/',1)[1].rsplit('/photos',1)[0]); n=int(self.headers.get('Content-Length','0'))
+                if n>MAX_PHOTO_BYTES:return self._json(413,{'error':'Bilden är för stor (max 15 MB)'})
+                data=self.rfile.read(n); name=unquote(self.headers.get('X-Photo-Filename','photo.jpg')); caption=unquote(self.headers.get('X-Photo-Caption','')); featured=self.headers.get('X-Photo-Featured','false').lower()=='true'
+                return self._json(201,add_bake_photo(bid,data,name,caption,featured))
+            if '/api/bakes/' in path and '/photos/' in path and path.endswith('/featured'):
+                rest=path.split('/api/bakes/',1)[1].rsplit('/featured',1)[0]; bid,photo_id=map(unquote,rest.split('/photos/',1)); self._body(); return self._json(200,set_featured_photo(bid,photo_id))
             if path.endswith('/api/active-bake') or path=='/api/active-bake':
                 p=self._body(); set_active_bake(p.get('id')); return self._json(200,{'active_bake_id':active_bake_id})
             if '/api/bakes/' in path and '/phase/' in path:
@@ -426,6 +487,10 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path.rstrip('/')
         if path.endswith('/api/roi') or path=='/api/roi': return self._json(200,clear_roi_override())
         if path.endswith('/api/detection') or path=='/api/detection': return self._json(200,clear_detection_override())
+        if '/api/bakes/' in path and '/photos/' in path:
+            rest=path.split('/api/bakes/',1)[1]; bid,photo_id=map(unquote,rest.split('/photos/',1))
+            try:delete_bake_photo(bid,photo_id); return self._json(200,{'deleted':photo_id})
+            except (KeyError,ValueError):return self._json(404,{'error':'not_found'})
         return self.send_error(404)
     def log_message(self,fmt,*args): LOG.debug('Web UI: '+fmt,*args)
 

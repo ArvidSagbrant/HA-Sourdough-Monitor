@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+
+- Added photo uploads to each bake, with optional captions and support for multiple process photos.
+- Added a featured final-loaf photo and a responsive bake gallery.
+- Added controls to promote another photo or permanently remove a photo.
+
 ## 0.6.0
 
 - Active monitoring sessions now resume automatically after an add-on or Home Assistant restart.
