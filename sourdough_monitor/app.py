@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 OPTIONS_PATH=Path('/data/options.json'); ROI_OVERRIDE_PATH=Path('/data/roi.json'); DETECTION_OVERRIDE_PATH=Path('/data/detection.json'); UI_PATH=Path('/app/ui.html')
 MEDIA_ROOT=Path('/media/sourdough'); DB_PATH=Path('/data/sourdough_journal.db')
-DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.5.0'
+DEVICE_ID='sourdough_monitor'; BASE_TOPIC='sourdough_monitor'; DISCOVERY_PREFIX='homeassistant'; VERSION='0.6.0'
 
 session_lock=threading.Lock(); cfg_lock=threading.RLock()
 session_active=False; session_dir=None; session_started=None; baseline_height_px=None; frame_no=0; last_timelapse_build=0.0
@@ -57,6 +57,37 @@ def persist_active_bake():
     with db() as c:
         if active_bake_id is None: c.execute("DELETE FROM app_state WHERE key='active_bake_id'")
         else: c.execute("INSERT INTO app_state(key,value) VALUES('active_bake_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(active_bake_id,))
+def persist_session():
+    if not session_active or not session_dir: return
+    state={'dir':session_dir.name,'started_at':session_started.isoformat() if session_started else None,
+           'baseline_height_px':baseline_height_px,'frame_no':frame_no,'peak_growth':peak_growth,
+           'peak_frame':Path(peak_frame_path).name if peak_frame_path else None,
+           'start_frame':Path(start_frame_path).name if start_frame_path else None,
+           'last_frame':Path(last_frame_path).name if last_frame_path else None,
+           'edge_history':list(edge_history),'last_growth_values':list(last_growth_values)}
+    with db() as c: c.execute("INSERT INTO app_state(key,value) VALUES('monitor_session',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(state),))
+def clear_persisted_session():
+    with db() as c: c.execute("DELETE FROM app_state WHERE key='monitor_session'")
+def restore_session():
+    global session_active,session_dir,session_started,baseline_height_px,frame_no,last_timelapse_build,peak_growth,peak_frame_path,start_frame_path,last_frame_path
+    with db() as c: row=c.execute("SELECT value FROM app_state WHERE key='monitor_session'").fetchone()
+    if not row: return False
+    try:
+        state=json.loads(row['value']); current=MEDIA_ROOT/state['dir']; frames_dir=current/'frames'
+        if current.parent!=MEDIA_ROOT or not current.name.startswith('session_') or not frames_dir.is_dir(): raise ValueError('Ogiltig sessionskatalog')
+        frames=sorted(frames_dir.glob('*.jpg')); names={p.name:p for p in frames}
+        session_dir=current; session_started=datetime.fromisoformat(state['started_at']) if state.get('started_at') else datetime.now()
+        baseline_height_px=state.get('baseline_height_px'); frame_no=max(int(state.get('frame_no') or 0),max((int(p.stem)+1 for p in frames if p.stem.isdigit()),default=0))
+        peak_growth=float(state.get('peak_growth',-1.)); peak_frame_path=names.get(state.get('peak_frame'))
+        start_frame_path=names.get(state.get('start_frame')) or (frames[0] if frames else None)
+        last_frame_path=frames[-1] if frames else None
+        edge_history.clear(); edge_history.extend(state.get('edge_history') or [])
+        last_growth_values.clear(); last_growth_values.extend(state.get('last_growth_values') or [])
+        session_active=True; last_timelapse_build=time.time()
+        LOG.info('Återupptar session %s från bild %s',current.name,frame_no)
+        return True
+    except Exception:
+        LOG.exception('Kunde inte återuppta sparad session'); clear_persisted_session(); return False
 def decode_bake(r):
     d=dict(r)
     for k in JSON_COLS: d[k]=json.loads(d.pop(k+'_json') or '{}')
@@ -309,12 +340,12 @@ def start_session():
     global session_active,session_dir,session_started,baseline_height_px,frame_no,last_timelapse_build,peak_growth,peak_frame_path,start_frame_path,last_frame_path
     with session_lock:
         if session_active:return
-        session_dir=MEDIA_ROOT/('session_'+datetime.now().strftime('%Y%m%d-%H%M%S')); (session_dir/'frames').mkdir(parents=True,exist_ok=True); session_started=datetime.now(); baseline_height_px=None; frame_no=0; edge_history.clear(); last_growth_values.clear(); peak_growth=-1.; peak_frame_path=start_frame_path=last_frame_path=None; session_active=True; last_timelapse_build=time.time()
+        session_dir=MEDIA_ROOT/('session_'+datetime.now().strftime('%Y%m%d-%H%M%S')); (session_dir/'frames').mkdir(parents=True,exist_ok=True); session_started=datetime.now(); baseline_height_px=None; frame_no=0; edge_history.clear(); last_growth_values.clear(); peak_growth=-1.; peak_frame_path=start_frame_path=last_frame_path=None; session_active=True; last_timelapse_build=time.time(); persist_session()
     if active_bake_id: update_bake(active_bake_id,{'media':{'session':session_dir.name},'process':{'starter_monitor_started_at':now_iso()}})
     publish(f'{BASE_TOPIC}/state/active','ON',True); publish(f'{BASE_TOPIC}/state/session',session_dir.name,True); publish(f'{BASE_TOPIC}/state/status','calibrating',True); publish_timelapse_state('recording',session_dir.name,0); prune_sessions()
 def stop_session():
     global session_active
-    with session_lock: was=session_active; session_active=False; name=session_dir.name if session_dir else None; frames=frame_no
+    with session_lock: was=session_active; session_active=False; name=session_dir.name if session_dir else None; frames=frame_no; clear_persisted_session()
     if was:
         publish_timelapse_state('building',name,frames)
         try: build_timelapse(); finalize_keyframes_and_cleanup(); publish(f'{BASE_TOPIC}/state/status','stopped',True)
@@ -328,7 +359,7 @@ def process_frame():
         growth=100.*height/max(1,baseline_height_px); status=infer_status(growth); ann=annotate(img,edge,roi,growth,conf,status); fp=session_dir/'frames'/f'{frame_no:06d}.jpg'; cv2.imwrite(str(fp),ann,[cv2.IMWRITE_JPEG_QUALITY,88])
         if frame_no==0:start_frame_path=fp
         if growth>peak_growth: peak_growth=growth; peak_frame_path=fp
-        last_frame_path=fp; frame_no+=1; cv2.imwrite(str(MEDIA_ROOT/'latest.jpg'),ann,[cv2.IMWRITE_JPEG_QUALITY,88]); ok,enc=cv2.imencode('.jpg',ann,[cv2.IMWRITE_JPEG_QUALITY,88]); elapsed=int((datetime.now()-session_started).total_seconds()/60) if session_started else 0; sname=session_dir.name
+        last_frame_path=fp; frame_no+=1; persist_session(); cv2.imwrite(str(MEDIA_ROOT/'latest.jpg'),ann,[cv2.IMWRITE_JPEG_QUALITY,88]); ok,enc=cv2.imencode('.jpg',ann,[cv2.IMWRITE_JPEG_QUALITY,88]); elapsed=int((datetime.now()-session_started).total_seconds()/60) if session_started else 0; sname=session_dir.name
     if ok: publish_binary(f'{BASE_TOPIC}/image/preview',enc.tobytes(),True)
     for k,v in [('growth',f'{growth:.1f}'),('height',height),('edge_y',edge),('frames',frame_no),('elapsed',elapsed),('status',status)]: publish(f'{BASE_TOPIC}/state/{k}',str(v),True)
     add_measurement(active_bake_id,sname,growth,height,edge,conf,status); publish_timelapse_state('recording',sname,frame_no)
@@ -416,7 +447,7 @@ def setup_mqtt():
 
 def main():
     global cfg,edge_history
-    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
+    MEDIA_ROOT.mkdir(parents=True,exist_ok=True); init_db(); load_active_bake(); cfg=load_options(); cfg.update(DETECTION_DEFAULTS); cfg.update(load_roi_override()); cfg.update(load_detection_override()); edge_history=deque(maxlen=int(cfg['smoothing_frames'])); restore_session(); start_web_ui(); setup_mqtt(); publish(f'{BASE_TOPIC}/availability','online',True); LOG.info('Sourdough Monitor %s startad',VERSION)
     while True:
         try:
             if session_active: process_frame(); time.sleep(max(1,int(cfg['interval_seconds'])))

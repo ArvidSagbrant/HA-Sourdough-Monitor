@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Active monitoring sessions now resume automatically after an add-on or Home Assistant restart.
+- Session timing, baseline, frame numbering, detection history, and keyframe tracking are preserved.
+- Sessions stopped deliberately remain stopped after a restart.
+
 ## 0.5.0
 
 - Added camera preview zoom up to 800% using toolbar buttons, the mouse wheel, or pinch gestures.

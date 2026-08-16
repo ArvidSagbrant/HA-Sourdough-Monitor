@@ -31,6 +31,7 @@ Under **Kamera & detektion → Detektionslabb** kan OpenCV-inställningarna prov
 - Detektionsjusteringar sparas i `/data/detection.json`.
 - Bilder och timelapse sparas under `/media/sourdough`.
 - Äldre sessioner begränsas med inställningen `keep_sessions`.
+- En aktiv övervakningssession återupptas automatiskt efter omstart med samma starttid, baslinje och bildsekvens. En session som stoppats manuellt förblir stoppad.
 
 ## MQTT-entiteter
 

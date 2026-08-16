@@ -1,5 +1,5 @@
 name: "Sourdough Monitor"
-version: "0.5.0"
+version: "0.6.0"
 slug: "sourdough_monitor"
 description: "Monitor a sourdough starter with IP Webcam, OpenCV, MQTT Discovery and automatic timelapse."
 url: "https://github.com/ArvidSagbrant/HA-Sourdough-Monitor"
